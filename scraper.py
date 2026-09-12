@@ -239,6 +239,11 @@ async def run_scraper(cfg, channels):
     if sc.get('auto_extract', True):
         print("\nRunning extractor...")
         subprocess.run([sys.executable, 'extractor.py'], check=False)
+    
+    # Optionally audition newly discovered channels
+    if sc.get('auto_discover', True):
+        print("\nRunning discovery validator...")
+        subprocess.run([sys.executable, 'discover.py'], check=False)
 
 
 # ================= ENTRY POINT =================

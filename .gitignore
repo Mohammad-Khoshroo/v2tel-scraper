@@ -1,4 +1,16 @@
+# Personal credentials - NEVER commit
+APIK.lock
 config.toml
-v2tel_scraper.session
-output
-APIK.txt
+
+
+# Telegram login sessions - NEVER commit
+*.session
+*.session-journal
+
+# Generated data
+database/
+output/
+
+# Python
+__pycache__/
+*.pycs
