@@ -1,38 +1,66 @@
 """
 Config & Proxy Extractor
-==============================
-Reads the scraper output (public_messages.txt) and splits the results into
-TWO separate files:
+========================
+Reads the scraper output (output/public_messages.txt) and splits the
+results into three database files:
 
-  1. proxies.txt  -> Telegram proxy links (MTProto / SOCKS)
-                     Format: tg://proxy?..., https://t.me/proxy?...,
-                             tg://socks?..., https://t.me/socks?...
-                     Paste into the Telegram app to connect.
+  database/proxy.log           -> Telegram proxy links (MTProto / SOCKS)
+                                  tg://proxy?..., https://t.me/socks?...
+                                  Paste into the Telegram app to connect.
 
-  2. configs.txt  -> VPN configuration URIs
-                     Format: vmess://, vless://, trojan://, ss://, ssr://,
-                             hysteria2://, tuic://, ...
-                     Paste into v2rayN (Servers -> Import from clipboard).
+  database/config.log          -> VPN configuration URIs
+                                  vmess://, vless://, trojan://, ss://, ...
+                                  Paste into v2rayN
+                                  (Servers -> Import from clipboard).
 
-A third file, external_links.txt, collects regular web links (possible
-subscription URLs, sites) for manual review only - do NOT paste it
-anywhere blindly.
+  database/external_links.log  -> regular web links (possible subscription
+                                  URLs). Manual review only - do NOT paste
+                                  this file anywhere blindly.
+
+Existing database files are MERGED and deduplicated: every run accumulates
+results instead of replacing them. Deduplication is exact-string based, so
+configs that differ in ANY parameter (address, port, uuid, ...) are kept.
+
+Paths are read from config.toml.
 
 Usage:
-    python3 extract_configs.py [input_file]
-
-Default input file: public_messages.txt
+    python extractor.py [input_file]
 """
 
 import base64
+import os
 import re
 import sys
 
-INPUT_FILE = sys.argv[1] if len(sys.argv) > 1 else 'public_messages.txt'
+# Python 3.11+ ships tomllib; older versions need the 'tomli' package
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
-PROXIES_FILE = 'proxies.txt'         # Telegram proxy links
-CONFIGS_FILE = 'configs.txt'         # VPN config URIs (v2rayN etc.)
-LINKS_FILE = 'external_links.txt'    # web links, manual review only
+CONFIG_FILE = 'config.toml'
+
+
+def load_paths():
+    """Load output/database paths from config.toml."""
+    with open(CONFIG_FILE, 'rb') as f:
+        cfg = tomllib.load(f)
+    paths = cfg.get('paths', {})
+
+    output_dir = paths.get('output_dir', 'output')
+    db_dir = paths.get('database_dir', 'database')
+    return {
+        'input': os.path.join(output_dir,
+                              paths.get('messages_file', 'public_messages.txt')),
+        'proxies': os.path.join(db_dir,
+                                paths.get('proxy_log', 'proxy.log')),
+        'configs': os.path.join(db_dir,
+                                paths.get('config_log', 'config.log')),
+        'links': os.path.join(db_dir,
+                              paths.get('external_links_log',
+                                        'external_links.log')),
+    }
+
 
 # ---- Telegram proxy links (MTProto / SOCKS) ----
 # Matches: tg://proxy?..., tg://socks?...,
@@ -92,18 +120,36 @@ def try_decode_base64(block: str):
     return None
 
 
+def load_existing(path: str) -> dict:
+    """Read an existing database file into an ordered dict (dedup set)."""
+    items = {}
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    items.setdefault(line)
+    return items
+
+
 def main():
+    paths = load_paths()
+
+    input_file = sys.argv[1] if len(sys.argv) > 1 else paths['input']
+
     try:
-        with open(INPUT_FILE, 'r', encoding='utf-8') as f:
+        with open(input_file, 'r', encoding='utf-8') as f:
             content = f.read()
     except FileNotFoundError:
-        print(f"Input file not found: {INPUT_FILE}")
+        print(f"Input file not found: {input_file}")
         print("Run the scraper first, then run this script.")
         sys.exit(1)
 
-    proxies = {}  # dicts keep insertion order + deduplicate exactly
-    configs = {}
-    links = {}
+    # dicts keep insertion order and deduplicate exactly
+    proxies = load_existing(paths['proxies'])
+    configs = load_existing(paths['configs'])
+    links = load_existing(paths['links'])
+    old_counts = (len(proxies), len(configs), len(links))
 
     def harvest(text: str):
         """Pull proxy links, config URIs and web links out of a chunk."""
@@ -142,29 +188,34 @@ def main():
             b64_hits += 1
             harvest(decoded)
 
-    # ---- Write outputs ----
-    with open(PROXIES_FILE, 'w', encoding='utf-8') as f:
+    # ---- Write merged results back to the database files ----
+    os.makedirs(os.path.dirname(paths['proxies']) or '.', exist_ok=True)
+
+    with open(paths['proxies'], 'w', encoding='utf-8') as f:
         for link in proxies:
             f.write(link + '\n')
 
-    with open(CONFIGS_FILE, 'w', encoding='utf-8') as f:
+    with open(paths['configs'], 'w', encoding='utf-8') as f:
         for link in configs:
             f.write(link + '\n')
 
-    with open(LINKS_FILE, 'w', encoding='utf-8') as f:
+    with open(paths['links'], 'w', encoding='utf-8') as f:
         for url in links:
             f.write(url + '\n')
 
     print("=============== SUMMARY ===============")
-    print(f"Input file          : {INPUT_FILE}")
+    print(f"Input file          : {input_file}")
     print(f"Base64 blobs parsed : {b64_hits}")
-    print(f"Telegram proxies    : {len(proxies)}  -> {PROXIES_FILE}")
-    print(f"VPN config links    : {len(configs)}  -> {CONFIGS_FILE}")
-    print(f"External web links  : {len(links)}  -> {LINKS_FILE}")
+    print(f"Telegram proxies    : {len(proxies)} "
+          f"(+{len(proxies) - old_counts[0]} new)  -> {paths['proxies']}")
+    print(f"VPN config links    : {len(configs)} "
+          f"(+{len(configs) - old_counts[1]} new)  -> {paths['configs']}")
+    print(f"External web links  : {len(links)} "
+          f"(+{len(links) - old_counts[2]} new)  -> {paths['links']}")
     print("=======================================")
-    print(f"'{PROXIES_FILE}': paste a line into Telegram to connect via proxy.")
-    print(f"'{CONFIGS_FILE}' : copy all -> v2rayN -> Servers -> Import from clipboard.")
-    print(f"'{LINKS_FILE}'   : manual review only (possible subscription URLs).")
+    print("proxy.log : paste a line into Telegram to connect via proxy.")
+    print("config.log: copy all -> v2rayN -> Servers -> Import from clipboard.")
+    print("external_links.log: manual review only.")
 
 
 if __name__ == '__main__':

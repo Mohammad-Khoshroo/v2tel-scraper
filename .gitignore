@@ -1,3 +1,4 @@
 config.toml
-scraper_session.session
+v2tel_scraper.session
 output
+APIK.txt
