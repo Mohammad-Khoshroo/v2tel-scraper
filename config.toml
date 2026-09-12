@@ -1,0 +1,60 @@
+# ============================================================
+# v2tel-scraper configuration
+# All user-configurable settings live in this file.
+# ============================================================
+
+[telegram]
+session = "v2tel_scraper"
+
+[scraper]
+# How many latest messages to fetch from each channel
+message_limit = 1
+
+# Seconds to wait between channel requests (avoid Telegram rate limits)
+request_delay = 1
+
+# Run extractor.py automatically after scraping finishes
+auto_extract = true
+auto_discover = true
+
+
+[discovery] # NEW: audition settings for found channels
+enabled = true
+messages_per_channel = 100 # how many messages to read per candidate
+min_config_hits = 1        # unique proxy+config links needed to accept
+max_per_run = 20           # candidates checked per run (FloodWait protection)
+request_delay = 1.5
+
+
+[proxy]
+# Enable if Telegram is blocked in your network (see README section 4)
+enabled = true
+
+# "socks5" or "http"
+type = "socks5"
+
+# Host of the machine running the proxy:
+#   - same machine            -> 127.0.0.1
+#   - WSL2 mirrored mode      -> 127.0.0.1
+#   - WSL2 NAT mode           -> Windows host IP (see README)
+#   - another machine in LAN  -> that machine's IP
+host = "127.0.0.1"
+
+# SOCKS/HTTP port of your proxy tool (v2rayN default: 10808)
+port = 10808
+
+[paths]
+# Directory where scraped messages are written
+output_dir = "output"
+
+# Directory where result databases are stored
+database_dir = "database"
+
+# File names (inside the directories above)
+messages_file = "all_msg.txt"
+proxy_log = "proxy.log"
+config_log = "config.log"
+external_links_log = "external_links.log"
+channels_file = "channels.json"
+channel_status_file = "channel_status.json"
+discovered_channels_log = "discovered_channels.log"

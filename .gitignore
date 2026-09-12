@@ -1,7 +1,5 @@
 # Personal credentials - NEVER commit
 APIK.lock
-config.toml
-
 
 # Telegram login sessions - NEVER commit
 *.session
