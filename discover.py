@@ -22,6 +22,7 @@ Usage:
     python discover.py
 """
 
+from sync import add_entry_to_folder
 import asyncio
 import json
 import os
@@ -39,6 +40,7 @@ from extractor import PROXY_RE, CONFIG_RE, B64_RE, clean, try_decode_base64
 from scraper import extract_hidden_links, load_credentials
 
 CONFIG_FILE = 'config.toml'
+
 
 
 # ================= HELPERS =================
@@ -74,7 +76,12 @@ def load_channels_list(path):
     return data if isinstance(data, list) else []
 
 
+import shutil
+
 def save_channels_list(path, channels):
+    # Keep one backup of the previous state before overwriting
+    if os.path.exists(path):
+        shutil.copy2(path, path + '.bak')
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(channels, f, ensure_ascii=False, indent=2)
 
@@ -152,6 +159,8 @@ async def run():
     cfg = load_config()
     disc = cfg.get('discovery', {})
     paths = cfg.get('paths', {})
+    sync_cfg = cfg.get('sync', {})
+    folder_title = sync_cfg.get('folder_title', 'v2tel')
     tg = cfg.get('telegram', {})
 
     if not disc.get('enabled', True):
@@ -159,6 +168,8 @@ async def run():
         return
 
     db_dir = paths.get('database_dir', 'database')
+    folder_state_path = os.path.join(
+        db_dir, paths.get('folder_state_file', 'folder_state.json'))
     channels_path = os.path.join(db_dir,
                                  paths.get('channels_file', 'channels.json'))
     status_path = os.path.join(db_dir,
@@ -191,7 +202,14 @@ async def run():
             continue
         pending.append(c)
 
-    pending = pending[:max_per_run]
+    seen = set()
+    uniq = []
+    for c in pending:
+        k = c.lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(c)
+    pending = uniq[:max_per_run]
 
     print("================ DISCOVERY VALIDATOR ================")
     print(f"Candidates in log   : {len(candidates)}")
@@ -281,12 +299,25 @@ async def run():
 
             if hits >= min_hits:
                 channels.append(candidate)
-                known.add(key)
                 save_channels_list(channels_path, channels)
+                known.add(key)
                 status[key] = {'status': 'accepted', 'hits': hits,
                                'checked_at': datetime.now().isoformat()}
-                print(f"    [+] ACCEPTED -> added to channels.json")
+                print("    [+] ACCEPTED -> added to channels.json")
                 accepted += 1
+
+                # Make it visible in the Telegram folder immediately
+                try:
+                    changed = await add_entry_to_folder(
+                        client, folder_title,
+                        {'peer': candidate, 'id': None,
+                         'title': candidate, 'is_private': False},
+                        folder_state_path)
+                    if changed:
+                        print("    [+] Added to Telegram folder")
+                except Exception as e:
+                    print(f"    [!] Folder update failed: {str(e)[:60]} "
+                          f"(channel still saved; next sync will add it)")
             else:
                 status[key] = {'status': 'rejected', 'hits': hits,
                                'reason': 'not enough links',
@@ -302,8 +333,7 @@ async def run():
     print(f"Checked   : {accepted + rejected}")
     print(f"Accepted  : {accepted}  -> database/channels.json")
     print(f"Rejected  : {rejected}  -> database/channel_status.json")
-    print(f"Remaining : {len(candidates) - accepted - rejected} pending "
-          f"for the next run")
+    print(f"Remaining : {len(pending) - accepted - rejected} pending ...")
     print("=================================================")
 
 

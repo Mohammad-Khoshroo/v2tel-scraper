@@ -1,0 +1,2068 @@
+# Project Structure
+
+```
+├── config.toml
+├── discover.py
+├── extractor.py
+├── main.py
+├── README.md
+├── scraper.py
+├── sync.py
+└── whoami.py
+```
+
+# File Contents
+
+## config.toml
+
+```toml
+# ============================================================
+# v2tel-scraper configuration
+# All user-configurable settings live in this file.
+# ============================================================
+[sync]
+enabled = true
+folder_title = "v2tel"     # Telegram folder mirroring channels.json
+include_private = true     # add ALL channel/group memberships (incl. private)
+join_delay = 3.0           # seconds between join attempts
+
+[scraper]
+# How many latest messages to fetch from each channel
+message_limit = 10
+
+# Seconds to wait between channel requests (avoid Telegram rate limits)
+request_delay = 1
+
+
+[discovery] # NEW: audition settings for found channels
+enabled = true
+messages_per_channel = 100  # how many messages to read per candidate
+min_config_hits = 1         # unique proxy+config links needed to accept
+max_per_run = 100           # candidates checked per run (FloodWait protection)
+request_delay = 2
+
+
+[proxy]
+# Enable if Telegram is blocked in your network (see README section 4)
+enabled = true
+
+# "socks5" or "http"
+type = "socks5"
+
+# Host of the machine running the proxy:
+#   - same machine            -> 127.0.0.1
+#   - WSL2 mirrored mode      -> 127.0.0.1
+#   - WSL2 NAT mode           -> Windows host IP (see README)
+#   - another machine in LAN  -> that machine's IP
+host = "127.0.0.1"
+
+# SOCKS/HTTP port of your proxy tool (v2rayN default: 10808)
+port = 10808
+
+[paths]
+# Directory where scraped messages are written
+output_dir = "output"
+
+# Directory where result databases are stored
+database_dir = "database"
+
+# File names (inside the directories above)
+messages_file = "all_msg.txt"
+proxy_log = "proxy.log"
+config_log = "config.log"
+external_links_log = "external_links.log"
+channels_file = "channels.json"
+channel_status_file = "channel_status.json"
+discovered_channels_log = "discovered_channels.log"
+folder_state_file = "folder_state.json"
+
+```
+
+## discover.py
+
+```python
+"""
+Channel Discovery Validator
+===========================
+After extractor.py has collected candidate channels in
+database/discovered_channels.log, this script "auditions" each NEW
+candidate: it fetches the last N messages of that channel and counts
+how many proxy/config links those messages contain.
+
+  - hits >= min_config_hits  -> the channel is appended to
+                                database/channels.json, so every future
+                                scraper run will scan it permanently.
+  - otherwise                -> the channel is marked 'rejected' in
+                                database/channel_status.json and is
+                                never re-checked again.
+
+The status file also stores the reason ('user', 'dead', 'private', ...)
+and prevents re-checking accepted channels.
+
+All settings come from config.toml ([discovery] and [paths]).
+
+Usage:
+    python discover.py
+"""
+
+from sync import add_entry_to_folder
+import asyncio
+import json
+import os
+import sys
+from datetime import datetime
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from telethon import TelegramClient, errors
+from telethon.tl.types import Channel, User
+import tomllib
+
+# Reuse the regexes/cleaners from extractor and the link extractor
+# from scraper so the detection logic stays identical everywhere.
+from extractor import PROXY_RE, CONFIG_RE, B64_RE, clean, try_decode_base64
+from scraper import extract_hidden_links, load_credentials
+
+CONFIG_FILE = 'config.toml'
+
+
+
+# ================= HELPERS =================
+def channel_keys(channels):
+    """Usernames/ids present in the list (mixed string/dict format)."""
+    keys = set()
+    for e in channels:
+        if isinstance(e, str):
+            keys.add(e.strip().lower())
+        elif isinstance(e, dict):
+            u = e.get('username')
+            if u:
+                keys.add(u.lower())
+            elif e.get('peer_id') is not None:
+                keys.add(f"id:{e['peer_id']}")
+    return keys
+
+
+def load_config():
+    with open(CONFIG_FILE, 'rb') as f:
+        return tomllib.load(f)
+
+
+def load_channels_list(path):
+    """Load channels.json (a JSON array of '@username' strings)."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+import shutil
+
+def save_channels_list(path, channels):
+    # Keep one backup of the previous state before overwriting
+    if os.path.exists(path):
+        shutil.copy2(path, path + '.bak')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(channels, f, ensure_ascii=False, indent=2)
+
+
+def load_status(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_status(path, status):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(status, f, ensure_ascii=False, indent=2)
+
+
+def load_lines(path):
+    items = []
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    items.append(line)
+    return items
+
+
+# ================= HIT COUNTING =================
+def count_hits(messages):
+    """
+    Count unique proxy/config links inside a batch of Telethon messages.
+
+    Scans:
+      - the plain message text
+      - hidden hyperlinks / buttons / previews (via scraper.extract_hidden_links)
+      - base64-encoded blobs pasted inside messages
+
+    Returns the number of UNIQUE links found.
+    """
+    hits = set()
+
+    def harvest(text):
+        for m in PROXY_RE.finditer(text):
+            link = clean(m.group(0))
+            if len(link) > 15:
+                hits.add(link)
+        for m in CONFIG_RE.finditer(text):
+            link = clean(m.group(0))
+            if len(link) > 12:
+                hits.add(link)
+
+    for msg in messages:
+        text = msg.message or ""
+        harvest(text)
+
+        # Hidden links (entities, buttons, preview)
+        for _source, _label, url in extract_hidden_links(msg):
+            harvest(url)
+
+        # Base64 blobs inside the message body
+        for m in B64_RE.finditer(text):
+            decoded = try_decode_base64(m.group(0))
+            if decoded:
+                harvest(decoded)
+
+    return len(hits)
+
+
+# ================= MAIN =================
+async def run():
+    cfg = load_config()
+    disc = cfg.get('discovery', {})
+    paths = cfg.get('paths', {})
+    sync_cfg = cfg.get('sync', {})
+    folder_title = sync_cfg.get('folder_title', 'v2tel')
+    tg = cfg.get('telegram', {})
+
+    if not disc.get('enabled', True):
+        print("Discovery is disabled in config.toml ([discovery] enabled).")
+        return
+
+    db_dir = paths.get('database_dir', 'database')
+    folder_state_path = os.path.join(
+        db_dir, paths.get('folder_state_file', 'folder_state.json'))
+    channels_path = os.path.join(db_dir,
+                                 paths.get('channels_file', 'channels.json'))
+    status_path = os.path.join(db_dir,
+                               paths.get('channel_status_file',
+                                         'channel_status.json'))
+    discovered_path = os.path.join(
+        db_dir, paths.get('discovered_channels_log',
+                          'discovered_channels.log'))
+
+    messages_limit = int(disc.get('messages_per_channel', 100))
+    min_hits = int(disc.get('min_config_hits', 1))
+    max_per_run = int(disc.get('max_per_run', 20))
+    request_delay = float(disc.get('request_delay', 1.5))
+
+    # ---- Load state ----
+    channels = load_channels_list(channels_path)
+    known = channel_keys(channels)
+    status = load_status(status_path)
+    candidates = load_lines(discovered_path)
+
+    # A candidate is "pending" if it is not already a channel and has
+    # never been checked before (no entry in the status file).
+    pending = []
+    for c in candidates:
+        key = c.lower()
+        if key in known:
+            continue
+        entry = status.get(key)
+        if entry and entry.get('status') in ('accepted', 'rejected', 'dead'):
+            continue
+        pending.append(c)
+
+    seen = set()
+    uniq = []
+    for c in pending:
+        k = c.lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(c)
+    pending = uniq[:max_per_run]
+
+    print("================ DISCOVERY VALIDATOR ================")
+    print(f"Candidates in log   : {len(candidates)}")
+    print(f"Already known       : {len(known)} channels in channels.json")
+    print(f"Pending this run    : {len(pending)} "
+          f"(max_per_run = {max_per_run})")
+    print("=====================================================\n")
+
+    if not pending:
+        print("Nothing to check. Done.")
+        return
+
+    # ---- Connect ----
+    import socks
+    pc = cfg.get('proxy', {})
+    proxy = None
+    if pc.get('enabled', False):
+        ptype = socks.SOCKS5 if pc.get('type', 'socks5') == 'socks5' else socks.HTTP
+        proxy = (ptype, pc.get('host', '127.0.0.1'), int(pc.get('port', 10808)))
+
+    api_id, api_hash = load_credentials()
+    client = TelegramClient(
+        tg.get('session', 'v2tel_scraper'),
+        api_id,
+        api_hash,
+        proxy=proxy,
+    )
+    
+    accepted = 0
+    rejected = 0
+
+    async with client:
+        for i, candidate in enumerate(pending, start=1):
+            key = candidate.lower()
+            print(f"[{i}/{len(pending)}] Auditioning {candidate} ...")
+
+            # --- Resolve the entity first (is it even a channel?) ---
+            try:
+                entity = await client.get_entity(candidate)
+            except errors.FloodWaitError as e:
+                print(f"    [!] FloodWait {e.seconds}s - stopping this run, "
+                      f"remaining candidates stay pending.")
+                break
+            except ValueError:
+                print("    [x] Invalid/unresolvable username -> rejected")
+                status[key] = {'status': 'rejected', 'reason': 'invalid',
+                               'checked_at': datetime.now().isoformat()}
+                save_status(status_path, status)
+                rejected += 1
+                continue
+            except errors.RPCError as e:
+                print(f"    [x] Telegram error: {str(e)[:60]} -> rejected")
+                status[key] = {'status': 'rejected', 'reason': str(e)[:60],
+                               'checked_at': datetime.now().isoformat()}
+                save_status(status_path, status)
+                rejected += 1
+                continue
+
+            # Users (personal accounts) are not interesting for us
+            if isinstance(entity, User):
+                kind = 'bot' if getattr(entity, 'bot', False) else 'personal account'
+                print(f"    [x] This is a {kind}, not a channel -> rejected")
+                status[key] = {'status': 'rejected', 'reason': kind,
+                               'checked_at': datetime.now().isoformat()}
+                save_status(status_path, status)
+                rejected += 1
+                continue
+
+            # --- Fetch the last N messages and count config/proxy hits ---
+            try:
+                messages = await client.get_messages(entity,
+                                                     limit=messages_limit)
+            except errors.FloodWaitError as e:
+                print(f"    [!] FloodWait {e.seconds}s - stopping this run.")
+                break
+            except (ValueError, errors.RPCError) as e:
+                print(f"    [x] Cannot read messages: {str(e)[:60]} -> rejected")
+                status[key] = {'status': 'rejected', 'reason': str(e)[:60],
+                               'checked_at': datetime.now().isoformat()}
+                save_status(status_path, status)
+                rejected += 1
+                continue
+
+            hits = count_hits(messages)
+            print(f"    > Read {len(messages)} messages, "
+                  f"found {hits} unique proxy/config link(s)")
+
+            if hits >= min_hits:
+                channels.append(candidate)
+                save_channels_list(channels_path, channels)
+                known.add(key)
+                status[key] = {'status': 'accepted', 'hits': hits,
+                               'checked_at': datetime.now().isoformat()}
+                print("    [+] ACCEPTED -> added to channels.json")
+                accepted += 1
+
+                # Make it visible in the Telegram folder immediately
+                try:
+                    changed = await add_entry_to_folder(
+                        client, folder_title,
+                        {'peer': candidate, 'id': None,
+                         'title': candidate, 'is_private': False},
+                        folder_state_path)
+                    if changed:
+                        print("    [+] Added to Telegram folder")
+                except Exception as e:
+                    print(f"    [!] Folder update failed: {str(e)[:60]} "
+                          f"(channel still saved; next sync will add it)")
+            else:
+                status[key] = {'status': 'rejected', 'hits': hits,
+                               'reason': 'not enough links',
+                               'checked_at': datetime.now().isoformat()}
+                print(f"    [-] Rejected (needs >= {min_hits} hits)")
+                rejected += 1
+
+            # Save status after every candidate (crash-safe)
+            save_status(status_path, status)
+            await asyncio.sleep(request_delay)
+
+    print("\n==================== SUMMARY ====================")
+    print(f"Checked   : {accepted + rejected}")
+    print(f"Accepted  : {accepted}  -> database/channels.json")
+    print(f"Rejected  : {rejected}  -> database/channel_status.json")
+    print(f"Remaining : {len(pending) - accepted - rejected} pending ...")
+    print("=================================================")
+
+
+def main():
+    asyncio.run(run())
+
+
+if __name__ == '__main__':
+    main()
+```
+
+## extractor.py
+
+```python
+"""
+Config & Proxy Extractor
+========================
+Reads the scraper output (output/public_messages.txt) and splits the
+results into FIVE database files:
+
+  database/proxy.log               -> Telegram proxy links (MTProto / SOCKS)
+                                      tg://proxy?..., https://t.me/socks?...
+                                      Paste into the Telegram app to connect.
+
+  database/config.log              -> VPN configuration URIs
+                                      vmess://, vless://, trojan://, ss://, ...
+                                      Paste into v2rayN
+                                      (Servers -> Import from clipboard).
+
+  database/external_links.log      -> regular web links (possible subscription
+                                      URLs). Manual review only.
+
+  database/telegram_links.log      -> raw Telegram entity links (channel
+                                      links, private invites, bots).
+
+  database/discovered_channels.log -> public channel usernames found inside
+                                      messages, normalized to "@username".
+                                      Review them and copy the good ones
+                                      into database/channels.json.
+
+Existing database files are MERGED and deduplicated: every run accumulates
+results instead of replacing them. Deduplication is exact-string based, so
+configs that differ in ANY parameter (address, port, uuid, ...) are kept.
+
+Paths are read from config.toml.
+
+Usage:
+    python extractor.py [input_file]
+"""
+
+import base64
+import os
+import re
+import sys
+
+# Python 3.11+ ships tomllib; older versions need the 'tomli' package
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+CONFIG_FILE = 'config.toml'
+
+
+def load_paths():
+    """Load output/database paths from config.toml."""
+    with open(CONFIG_FILE, 'rb') as f:
+        cfg = tomllib.load(f)
+    paths = cfg.get('paths', {})
+
+    output_dir = paths.get('output_dir', 'output')
+    db_dir = paths.get('database_dir', 'database')
+    return {
+        'input': os.path.join(output_dir,
+                              paths.get('messages_file', 'public_messages.txt')),
+        'proxies': os.path.join(db_dir,
+                                paths.get('proxy_log', 'proxy.log')),
+        'configs': os.path.join(db_dir,
+                                paths.get('config_log', 'config.log')),
+        'links': os.path.join(db_dir,
+                              paths.get('external_links_log',
+                                        'external_links.log')),
+        'tg_links': os.path.join(db_dir,
+                                 paths.get('telegram_links_log',
+                                           'telegram_links.log')),
+        'discovered': os.path.join(db_dir,
+                                   paths.get('discovered_channels_log',
+                                             'discovered_channels.log')),
+    }
+
+
+# ---- Telegram proxy links (MTProto / SOCKS) ----
+# Matches: tg://proxy?..., tg://socks?...,
+#          https://t.me/proxy?..., https://t.me/socks?...
+PROXY_RE = re.compile(
+    r'(?<![\w.-])('
+    r'tg://(?:proxy|socks)'
+    r'|https?://t\.me/(?:proxy|socks)'
+    r'|https?://telegram\.me/(?:proxy|socks)'
+    r')\?[^\s<>"\'`\\]+',
+    re.IGNORECASE,
+)
+
+# ---- VPN config URIs ----
+# Longer scheme names first so e.g. 'hysteria2' is not cut to 'hysteria'
+# and 'ssr' is not cut to 'ss'.
+CONFIG_RE = re.compile(
+    r'(?<![\w.-])('
+    r'vmess|vless|trojan|hysteria2|hy2|hysteria|ssr|ss|tuic|juicity|socks'
+    r')://[^\s<>"\'`\\]+',
+    re.IGNORECASE,
+)
+
+# ---- Telegram entity links (channels, invites, bots, ...) ----
+TG_LINK_RE = re.compile(
+    r'(?<![\w.-])('
+    r'https?://t\.me/[^\s<>"\'`\\]+'
+    r'|https?://telegram\.me/[^\s<>"\'`\\]+'
+    r'|tg://resolve\?[^\s<>"\'`\\]+'
+    r'|tg://join\?[^\s<>"\'`\\]+'
+    r')',
+    re.IGNORECASE,
+)
+
+# ---- Plain web links (possible subscription URLs etc.) ----
+URL_RE = re.compile(r'https?://[^\s<>"\'`\\]+', re.IGNORECASE)
+
+# Long base64-looking runs (channels often paste base64 config dumps)
+B64_RE = re.compile(r'[A-Za-z0-9+/]{80,}={0,2}')
+
+# Trailing punctuation the regexes may accidentally capture
+TRIM = '.,;:)]}>\'"`*_'
+
+# Domains that are never useful as external/subscription links
+TELEGRAM_DOMAINS = (
+    't.me', 'telegram.me', 'telegram.dog', 'telegram.org',
+    'cdn-telegram.org', 'core.telegram.org',
+)
+
+# t.me/<reserved_path> prefixes that are NOT channel usernames
+RESERVED_TG_PATHS = {
+    'share', 'addstickers', 'addemoji', 'addlist', 'addtheme',
+    'setlanguage', 'iv', 'proxy', 'socks', 'joinchat', 'contact',
+    'premium', 'privacy', 'tos', 'features', 'bg', 'boost',
+}
+
+# t.me/<username> or t.me/<username>/123 -> capture the username part
+TG_CHANNEL_RE = re.compile(
+    r'https?://(?:t\.me|telegram\.me)/([A-Za-z][A-Za-z0-9_]{2,64})',
+    re.IGNORECASE,
+)
+
+# tg://resolve?domain=<username> -> capture the username part
+TG_RESOLVE_RE = re.compile(
+    r'tg://resolve\?domain=([A-Za-z][A-Za-z0-9_]{2,64})',
+    re.IGNORECASE,
+)
+
+# Private invite forms
+TG_INVITE_RE = re.compile(
+    r'(/joinchat/|/\+|tg://join\?invite=)',
+    re.IGNORECASE,
+)
+
+
+def clean(link: str) -> str:
+    """Trim trailing punctuation/markdown leftovers from a link."""
+    return link.strip().rstrip(TRIM)
+
+
+def try_decode_base64(block: str):
+    """Base64-decode a block; return the text if it contains links."""
+    block = block.strip()
+    padded = block + '=' * ((-len(block)) % 4)
+    for candidate in (block, padded):
+        try:
+            decoded = base64.b64decode(candidate, validate=False)
+            text = decoded.decode('utf-8', errors='ignore')
+            if '://' in text:
+                return text
+        except Exception:
+            continue
+    return None
+
+
+def load_existing(path: str) -> dict:
+    """Read an existing database file into an ordered dict (dedup set)."""
+    items = {}
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    items.setdefault(line)
+    return items
+
+
+def classify_tg_link(link: str):
+    """
+    Classify a Telegram entity link.
+
+    Returns:
+        ('channel', '@username')  for public channel/group links
+        ('invite', link)          for private invite links
+        None                      for proxy/socks (handled elsewhere)
+                                  or reserved/uninteresting paths
+    """
+    low = link.lower()
+
+    # Proxy links already handled by PROXY_RE
+    if 'proxy?' in low or 'socks?' in low:
+        return None
+
+    # Private invite links: t.me/+hash, t.me/joinchat/hash, tg://join?invite=..
+    if TG_INVITE_RE.search(link):
+        return ('invite', link)
+
+    # tg://resolve?domain=<username>
+    m = TG_RESOLVE_RE.match(link)
+    if m:
+        return ('channel', '@' + m.group(1))
+
+    # https://t.me/<username> or https://t.me/<username>/<msg_id>
+    m = TG_CHANNEL_RE.match(link)
+    if m:
+        username = m.group(1)
+        if username.lower() in RESERVED_TG_PATHS:
+            return None
+        return ('channel', '@' + username)
+
+    return None
+
+
+def main():
+    paths = load_paths()
+
+    input_file = sys.argv[1] if len(sys.argv) > 1 else paths['input']
+
+    try:
+        with open(input_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except FileNotFoundError:
+        print(f"Input file not found: {input_file}")
+        print("Run the scraper first, then run this script.")
+        sys.exit(1)
+
+    # dicts keep insertion order and deduplicate exactly
+    proxies = load_existing(paths['proxies'])
+    configs = load_existing(paths['configs'])
+    links = load_existing(paths['links'])
+    tg_links = load_existing(paths['tg_links'])
+    discovered = load_existing(paths['discovered'])
+
+    old_counts = (len(proxies), len(configs), len(links),
+                  len(tg_links), len(discovered))
+
+    def harvest(text: str):
+        """Pull all link types out of a text chunk."""
+        # 1) Telegram proxy links (must run FIRST, otherwise
+        #    https://t.me/proxy?... would be caught as a plain URL)
+        for m in PROXY_RE.finditer(text):
+            link = clean(m.group(0))
+            if len(link) > 15:
+                proxies.setdefault(link)
+
+        # 2) VPN config URIs
+        for m in CONFIG_RE.finditer(text):
+            link = clean(m.group(0))
+            if len(link) > 12:
+                configs.setdefault(link)
+
+        # 3) Telegram entity links (channels, invites)
+        for m in TG_LINK_RE.finditer(text):
+            link = clean(m.group(0))
+            if len(link) < 8:
+                continue
+
+            result = classify_tg_link(link)
+            if result is None:
+                continue
+
+            kind, value = result
+            if kind == 'channel':
+                discovered.setdefault(value)
+            else:  # 'invite'
+                tg_links.setdefault(link)
+
+        # 4) Plain web links (exclude telegram domains entirely)
+        for m in URL_RE.finditer(text):
+            url = clean(m.group(0))
+            low = url.lower()
+            if any(d in low for d in TELEGRAM_DOMAINS):
+                continue
+            # Skip proxy links already captured above
+            if re.search(r'/?(proxy|socks)\?', low):
+                continue
+            links.setdefault(url)
+
+    # 1) Scan the raw log text
+    harvest(content)
+
+    # 2) Scan base64-encoded blobs and harvest from their decoded text
+    b64_hits = 0
+    for m in B64_RE.finditer(content):
+        decoded = try_decode_base64(m.group(0))
+        if decoded:
+            b64_hits += 1
+            harvest(decoded)
+
+    # ---- Write merged results back to the database files ----
+    for path in (paths['proxies'], paths['configs'], paths['links'],
+                 paths['tg_links'], paths['discovered']):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+
+    with open(paths['proxies'], 'w', encoding='utf-8') as f:
+        for link in proxies:
+            f.write(link + '\n')
+
+    with open(paths['configs'], 'w', encoding='utf-8') as f:
+        for link in configs:
+            f.write(link + '\n')
+
+    with open(paths['links'], 'w', encoding='utf-8') as f:
+        for url in links:
+            f.write(url + '\n')
+
+    with open(paths['tg_links'], 'w', encoding='utf-8') as f:
+        for link in tg_links:
+            f.write(link + '\n')
+
+    with open(paths['discovered'], 'w', encoding='utf-8') as f:
+        for username in discovered:
+            f.write(username + '\n')
+
+    print("=============== SUMMARY ===============")
+    print(f"Input file          : {input_file}")
+    print(f"Base64 blobs parsed : {b64_hits}")
+    print(f"Telegram proxies    : {len(proxies)} "
+          f"(+{len(proxies) - old_counts[0]} new)  -> {paths['proxies']}")
+    print(f"VPN config links    : {len(configs)} "
+          f"(+{len(configs) - old_counts[1]} new)  -> {paths['configs']}")
+    print(f"External web links  : {len(links)} "
+          f"(+{len(links) - old_counts[2]} new)  -> {paths['links']}")
+    print(f"TG invite links     : {len(tg_links)} "
+          f"(+{len(tg_links) - old_counts[3]} new)  -> {paths['tg_links']}")
+    print(f"Discovered channels : {len(discovered)} "
+          f"(+{len(discovered) - old_counts[4]} new)  -> {paths['discovered']}")
+    print("=======================================")
+    print("proxy.log : paste a line into Telegram to connect via proxy.")
+    print("config.log: copy all -> v2rayN -> Servers -> Import from clipboard.")
+    print("external_links.log: manual review only (subscription URLs).")
+    print("discovered_channels.log: review and copy good ones into")
+    print("                         database/channels.json.")
+
+
+if __name__ == '__main__':
+    main()
+```
+
+## main.py
+
+```python
+"""
+v2tel-scraper - Main Orchestrator
+=================================
+Runs the three pipeline stages in order:
+
+  1. scraper.py    -> fetch latest messages from Telegram
+  2. extractor.py  -> parse links into the database files
+  3. discover.py   -> audition newly discovered channels
+
+Each stage runs as a separate process. IMPORTANT: stages never overlap,
+because they all share the same Telegram session file (SQLite) - running
+two clients at once would lock the session.
+
+All settings come from config.toml. Credentials come from APIK.lock.
+
+Usage:
+    python main.py                     # full pipeline
+    python main.py --skip-scraper      # extractor + discover only (no Telegram connection)
+    python main.py --only-extract      # extractor only
+    python main.py --only-discover     # discover only
+    python main.py --status            # show database summary and exit
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tomllib
+
+CONFIG_FILE = 'config.toml'
+
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+# ================= CONFIG =================
+def load_config(path=CONFIG_FILE):
+    """Load config.toml; fail fast with a clear message."""
+    full = os.path.join(SCRIPTS_DIR, path)
+    if not os.path.exists(full):
+        print(f"Config file not found: {full}")
+        print("Create a config.toml next to main.py (see README.md).")
+        sys.exit(1)
+
+    with open(full, 'rb') as f:
+        cfg = tomllib.load(f)
+    return cfg
+
+
+# ================= STATUS =================
+def count_lines(path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, 'r', encoding='utf-8') as f:
+        return sum(1 for line in f if line.strip())
+
+
+def show_status(cfg):
+    """Print a summary of the current database files."""
+    paths = cfg.get('paths', {})
+    db_dir = paths.get('database_dir', 'database')
+    output_dir = paths.get('output_dir', 'output')
+
+    def db(name):
+        return os.path.join(db_dir, name)
+
+    rows = [
+        ('Telegram proxies', db(paths.get('proxy_log', 'proxy.log'))),
+        ('VPN config links', db(paths.get('config_log', 'config.log'))),
+        ('External web links', db(paths.get('external_links_log',
+                                            'external_links.log'))),
+        ('TG invite links', db(paths.get('telegram_links_log',
+                                         'telegram_links.log'))),
+        ('Discovered channels', db(paths.get('discovered_channels_log',
+                                             'discovered_channels.log'))),
+    ]
+
+    print("\n================ DATABASE STATUS ================")
+    for label, path in rows:
+        print(f"{label:<20}: {count_lines(path):>6}  "
+              f"({os.path.relpath(path, SCRIPTS_DIR)})")
+
+    # channels.json
+    channels_path = db(paths.get('channels_file', 'channels.json'))
+    try:
+        with open(channels_path, 'r', encoding='utf-8') as f:
+            n_channels = len(json.load(f))
+    except Exception:
+        n_channels = 0
+    print(f"{'Active channels':<20}: {n_channels:>6}  "
+          f"({os.path.relpath(channels_path, SCRIPTS_DIR)})")
+
+    # channel_status.json breakdown
+    status_path = db(paths.get('channel_status_file', 'channel_status.json'))
+    try:
+        with open(status_path, 'r', encoding='utf-8') as f:
+            status = json.load(f)
+        counts = {}
+        for entry in status.values():
+            s = entry.get('status', '?')
+            counts[s] = counts.get(s, 0) + 1
+        parts = ', '.join(f"{k}: {v}" for k, v in sorted(counts.items()))
+        print(f"{'Auditioned (status)':<20}: {len(status):>6}  ({parts})")
+    except Exception:
+        print(f"{'Auditioned (status)':<20}: {0:>6}")
+
+    # raw output file size
+    raw = os.path.join(output_dir, paths.get('messages_file',
+                                             'public_messages.txt'))
+    if os.path.exists(raw):
+        size_kb = os.path.getsize(raw) / 1024
+        print(f"{'Raw messages file':<20}: {size_kb:>6.1f} KB  "
+              f"({os.path.relpath(raw, SCRIPTS_DIR)})")
+    print("=================================================")
+
+
+# ================= STAGE RUNNER =================
+def run_stage(script, description):
+    """Run one pipeline stage as a separate process."""
+    script_path = os.path.join(SCRIPTS_DIR, script)
+    if not os.path.exists(script_path):
+        print(f"[!] {script} not found next to main.py - skipping {description}.")
+        return False
+
+    print(f"\n{'=' * 60}")
+    print(f"  STAGE: {description}  ({script})")
+    print('=' * 60)
+
+    result = subprocess.run([sys.executable, script_path])
+
+    if result.returncode != 0:
+        print(f"\n[!] Stage '{description}' exited with code "
+              f"{result.returncode}.")
+        print("    Continuing anyway (databases are cumulative).")
+        return False
+    return True
+
+
+# ================= MAIN =================
+def main():
+    parser = argparse.ArgumentParser(
+        description='v2tel-scraper orchestrator')
+    parser.add_argument('--skip-sync', action='store_true',
+                        help='skip the channel/folder sync stage')
+    parser.add_argument('--skip-scraper', action='store_true',
+                        help='skip fetching (extract + discover only)')
+    parser.add_argument('--only-extract', action='store_true',
+                        help='run extractor only')
+    parser.add_argument('--only-discover', action='store_true',
+                        help='run discover only')
+    parser.add_argument('--status', action='store_true',
+                        help='show database summary and exit')
+    args = parser.parse_args()
+
+    cfg = load_config()
+
+    if args.status:
+        show_status(cfg)
+        return
+
+    print("===============================================")
+    print("           v2tel-scraper pipeline")
+    print("===============================================")
+
+    # --- Stage 0: sync ---
+    if not (args.skip_scraper or args.only_extract or args.only_discover
+            or args.skip_sync):
+        run_stage('sync.py', 'Join channels + sync folder + memberships')
+        
+    # --- Stage 1: scrape ---
+    if not (args.skip_scraper or args.only_extract or args.only_discover):
+        run_stage('scraper.py', 'Fetch messages from Telegram')
+
+    # --- Stage 2: extract ---
+    if not args.only_discover:
+        run_stage('extractor.py', 'Parse links into database')
+
+    # --- Stage 3: discover ---
+    if not args.only_extract:
+        run_stage('discover.py', 'Audition discovered channels')
+
+    # --- Final summary ---
+    print("\n")
+    show_status(cfg)
+
+
+if __name__ == '__main__':
+    main()
+```
+
+## README.md
+
+````markdown
+# v2tel-scraper
+
+A simple Python script that fetches the latest messages from a list of public
+Telegram channels and saves them to a text file.
+
+Works natively on **Windows**, natively on **Linux**, inside **WSL2**,
+or on a remote **server / VPS**.
+
+---
+
+## 1. Prerequisites
+
+- Python 3.8+
+- A Telegram account
+- Telegram API credentials (`api_id` and `api_hash`)
+```bash
+pip3 install telethon pysocks python-socks tomllib json
+```
+
+
+### Getting API credentials
+
+1. Go to <https://my.telegram.org>
+1. Log in with your phone number
+3. Open **API development tools**
+4. Create an application (platform choice does not matter)
+5. Copy your `api_id` (number) and `api_hash` (string)
+
+> Each Telegram account can create **only one** application, but you can use
+> those credentials in unlimited scripts.
+
+---
+
+## 2. Proxy Configuration (running from Iran?)
+
+Telegram is blocked in Iran, so the script must connect through a proxy.
+This section assumes a local **SOCKS5** proxy (v2rayN, v2rayA, Nekoray,
+clash, etc.).
+
+Pick the subsection matching **where the script runs** and **where the
+proxy runs**:
+
+| Your setup                                           | Use             |
+| ---------------------------------------------------- | --------------- |
+| Script + proxy on the same Windows machine           | Case 1          |
+| Script in WSL2 (mirrored mode)                       | Case 2          |
+| Script in WSL2 (NAT mode)                            | Case 3          |
+| Script on Linux, proxy on the **same** Linux machine | Case 4a         |
+| Script on Linux, proxy on **another** machine        | Case 4b         |
+| Script on a VPS **outside** Iran                     | No proxy needed |
+
+**Rule of thumb:** if the script and the proxy run on the *same machine*,
+use `127.0.0.1`. If they run on *different machines*, use the proxy
+machine's IP and make sure the proxy accepts LAN connections.
+
+---
+
+### Case 1 — Running natively on Windows
+
+The script and v2rayN run on the same system, so `127.0.0.1` works directly.
+
+**1.** Make sure v2rayN is running and connected.
+
+**2.** In the script, set:
+
+```python
+USE_PROXY = True
+PROXY_HOST = '127.0.0.1'
+PROXY_PORT = 10808
+```
+
+**3.** Run it:
+
+```bat
+python scraper.py
+```
+
+---
+
+### Case 2 — WSL2 Mirrored Mode (recommended for WSL)
+
+In mirrored mode, WSL shares the Windows `localhost`, so the Windows proxy is
+directly reachable at `127.0.0.1`.
+
+**1.** Make sure `C:\Users\<You>\.wslconfig` contains:
+
+```ini
+[wsl2]
+networkingMode=mirrored
+hostAddressLoopback=true
+```
+
+**2.** Restart WSL (in PowerShell):
+
+```powershell
+wsl --shutdown
+```
+
+**3.** Verify your mode from inside WSL:
+
+```bash
+wslinfo --networking-mode
+# must print: mirrored
+```
+
+**4.** Verify the proxy is reachable from WSL:
+
+```bash
+curl -x socks5h://127.0.0.1:10808 -I https://t.me --max-time 10
+```
+
+If you get an HTTP response (`HTTP/2 200` or `HTTP/2 302`), you are good.
+
+**5.** In the script, set:
+
+```python
+PROXY_HOST = '127.0.0.1'
+PROXY_PORT = 10808
+```
+
+---
+
+### Case 3 — WSL2 NAT Mode (default)
+
+In NAT mode, WSL is a separate virtual machine. The proxy runs on the Windows
+**host**, so you must use the host's IP and allow LAN connections.
+
+**1.** In v2rayN enable:
+
+```
+Settings → Options → ☑ Allow connections from LAN
+```
+
+Then restart v2rayN.
+
+**2.** Find the Windows host IP from inside WSL:
+
+```bash
+cat /etc/resolv.conf | grep nameserver | awk '{print $2}'
+```
+
+Example output: `172.25.80.1`
+
+**3.** In the script, set:
+
+```python
+PROXY_HOST = '172.25.80.1'   # your actual Windows host IP
+PROXY_PORT = 10808
+```
+
+**4.** If it still times out, allow port 10808 through the Windows Firewall
+(create an Inbound Rule for TCP 10808).
+
+---
+
+### Case 4 — Running natively on Linux
+
+#### Case 4a — Proxy on the same Linux machine
+
+This behaves like Case 1: script and proxy share `localhost`.
+
+Common proxy tools on Linux and their **default SOCKS ports**:
+
+| Tool                         | Default SOCKS5 port     |
+| ---------------------------- | ----------------------- |
+| v2rayA                       | `20170`                 |
+| Nekoray / NekoBox            | `2080`                  |
+| clash / mihomo               | `7890` (mixed)          |
+| xray / v2ray (manual config) | whatever you configured |
+
+**1.** Make sure your proxy tool is running and connected.
+
+**2.** Verify the proxy:
+
+```bash
+curl -x socks5h://127.0.0.1:20170 -I https://t.me --max-time 10
+# replace 20170 with your tool's actual port
+```
+
+**3.** In the script, set:
+
+```python
+USE_PROXY = True
+PROXY_HOST = '127.0.0.1'
+PROXY_PORT = 20170   # your tool's SOCKS port
+```
+
+**4.** Run it:
+
+```bash
+python3 scraper.py
+```
+
+#### Case 4b — Proxy on another machine (LAN / another PC)
+
+Same logic as Case 3, but between two Linux machines:
+
+**1.** On the machine running the proxy, make it listen on all interfaces
+(not just `127.0.0.1`) — e.g. enable "Allow LAN" in v2rayA/Nekoray settings,
+or set the inbound listen address to `0.0.0.0`.
+
+**2.** Find that machine's LAN IP (on the proxy machine):
+
+```bash
+ip addr | grep "inet " | grep -v 127.0.0.1
+```
+
+Example: `192.168.1.10`
+
+**3.** In the script, set:
+
+```python
+PROXY_HOST = '192.168.1.10'   # the proxy machine's LAN IP
+PROXY_PORT = 20170            # its SOCKS port
+```
+
+#### Case 4c — Remote server / VPS outside Iran
+
+If your server can reach Telegram directly, disable the proxy entirely:
+
+```python
+USE_PROXY = False
+```
+
+---
+
+### No proxy needed?
+
+If you are on a network with direct access to Telegram (no censorship),
+simply disable the proxy:
+
+```python
+USE_PROXY = False
+```
+
+---
+
+## 3. Running
+
+```bash
+# Windows
+python scraper.py
+
+# WSL / Linux
+python3 scraper.py
+```
+
+### First run — login
+
+The first run asks for:
+
+| Prompt            | What to enter                                                 |
+| ----------------- | ------------------------------------------------------------- |
+| Phone number      | International format, e.g. `+98912xxxxxxx`                    |
+| Confirmation code | Sent to your **Telegram app** (chat with "Telegram"), not SMS |
+| 2FA password      | Only if you have one enabled                                  |
+
+After login, a `scraper_session.session` file is created. Subsequent runs
+**skip the login entirely**.
+
+> Keep the `.session` file private — it grants full access to your account.
+
+### Output
+
+All messages are written to `public_messages.txt` next to the script.
+
+---
+
+## 4. Troubleshooting
+
+| Problem                           | Cause                             | Fix                                                                          |
+| --------------------------------- | --------------------------------- | ---------------------------------------------------------------------------- |
+| `ConnectionRefusedError`          | Proxy not listening / LAN blocked | Enable "Allow LAN", restart the proxy tool                                   |
+| Timeout                           | Wrong `PROXY_HOST` or port        | Verify with `curl -x socks5h://...` first                                    |
+| Timeout in NAT mode / Case 4b     | Firewall                          | Allow the SOCKS port (TCP) through the firewall                              |
+| `python` not recognized (Windows) | Python not in PATH                | Reinstall Python with "Add to PATH" checked                                  |
+| `FloodWait` in output             | Telegram rate limit               | Script sleeps automatically and continues; lower `MESSAGE_LIMIT` if frequent |
+| `Could not find the input entity` | Channel deleted/renamed           | Ignore — script continues with remaining channels                            |
+
+---
+````
+
+## scraper.py
+
+```python
+"""
+v2tel-scraper
+=============
+Fetches the latest messages from public Telegram channels and saves them
+- together with any HIDDEN links (embedded hyperlinks, inline buttons,
+web previews) - to a local log file.
+
+Settings are read from config.toml.
+Channels are read from database/channels.json (seeded with a default
+list on the very first run).
+
+Usage:
+    python scraper.py
+"""
+
+import asyncio
+import json
+import os
+import socks
+import sys
+import tomllib
+
+from telethon import TelegramClient, errors
+from telethon.tl.types import (
+    MessageEntityTextUrl,
+    MessageEntityMentionName,
+)
+
+
+CONFIG_FILE = 'config.toml'
+CREDENTIALS_FILE = 'APIK.lock'
+
+# Channels written to database/channels.json on the very first run.
+# Edit database/channels.json afterwards to add/remove channels.
+DEFAULT_CHANNELS = [
+    '@freedom_iran_npv', '@projectXhttp', '@Pruuxi', '@v2rayNGt', '@VpnQavi', '@v2rayngfars',
+    '@Freenetirano', '@share_config', '@NetAccount', '@BugFreeNet_Chat',
+    '@saministamm', '@persianvpnhub', '@V2rayTun0', '@iiproxyIran', '@V2Ray_Tz',
+    '@configmax', '@canfmelishkn', '@vpn_Click', '@YamYamProxy', '@v2ra_config',
+    '@PeopleProxy', '@ConfigX2ray', '@ProxyMTProto', '@NT_Safe', '@F0X_CONFIG',
+    '@VPN_SOLVE', '@BugFreeNet', '@Eag1e_YT', '@VPNCUSTOMIZE', '@Network_442', '@NetZone_ir', '@iRoProxy',
+    '@Proxymelimon', '@V2rayEnglish', '@Net_3rf', '@MiniFoxTeam', '@AstroVPN_official', '@Proxxiy',
+    '@DirectVPN', '@PrivateVPNs', '@Azadnet_Npv', '@PewezaTech', '@Config_magazine',
+    '@MelliNet_NpV', '@vpnfredom', '@TapsiVpn', '@EsTunnel', '@v2rayng_fars', '@vmessorg', '@nufilter',
+    '@iP_CF', '@ZagfaVPN', '@BegzarVPN', '@ircfspace', '@vpn_v2rayNG_fast', '@Maznet',
+    '@SafeNet_Server', '@FAR30TM', '@free_netplus', '@eafciran7', '@V2Good', '@vpn_proxy400', '@canfigm',
+    '@AzadNet', '@ShadowProxy66', '@vpn_proxy66', '@Begoo_VPN', '@Free_Nettm', '@Whitee_vpn',
+    '@NormanV2ray', '@white_configs', '@wbnet', '@SudoFlux', '@arash_vpn', '@AstroVPNConfigBot',
+    '@TeleProxyTele', '@MTPROTO_PROXY01', '@Pruuxii', '@v2rayngfarse',
+]
+
+
+# ================= CONFIG =================
+def load_config(path=CONFIG_FILE):
+    """Load config.toml and validate the essential fields."""
+    if not os.path.exists(path):
+        print(f"Config file not found: {path}")
+        print("Create a config.toml next to scraper.py (see README.md).")
+        sys.exit(1)
+
+    with open(path, 'rb') as f:
+        cfg = tomllib.load(f)
+        
+    return cfg
+
+def load_credentials(path=CREDENTIALS_FILE):
+    """
+    Read api_id / api_hash from the personal APIK.lock file.
+
+    Format: simple 'key = value' lines; '#' starts a comment.
+    Keeps credentials out of config.toml so the project can be shared
+    without leaking them.
+    """
+    if not os.path.exists(path):
+        print(f"Credentials file not found: {path}")
+        print("Create it next to scraper.py with these two lines:")
+        print("    api_id = <your api_id>")
+        print("    api_hash = <your api_hash>")
+        print("Get them from https://my.telegram.org -> API development tools.")
+        sys.exit(1)
+
+    creds = {}
+    with open(path, 'r', encoding='utf-8') as f:
+        for raw in f:
+            line = raw.split('#', 1)[0].strip()  # strip comments
+            if not line or '=' not in line:
+                continue
+            key, _, value = line.partition('=')
+            creds[key.strip().lower()] = value.strip().strip('"\'')
+
+    api_id = creds.get('api_id', '')
+    api_hash = creds.get('api_hash', '')
+
+    if not api_id.isdigit():
+        print(f"Invalid or missing 'api_id' in {path}.")
+        sys.exit(1)
+    if not api_hash or api_hash.startswith('PASTE_'):
+        print(f"Invalid or missing 'api_hash' in {path}.")
+        sys.exit(1)
+
+    return int(api_id), api_hash
+
+def build_proxy(pc):
+    """Build the proxy tuple for Telethon, or None if disabled."""
+    if not pc.get('enabled', False):
+        return None
+    ptype = socks.SOCKS5 if pc.get('type', 'socks5') == 'socks5' else socks.HTTP
+    return (ptype, pc.get('host', '127.0.0.1'), int(pc.get('port', 10808)))
+
+
+# ================= CHANNELS =================
+def load_channels(db_dir, channels_file):
+    """
+    Load and normalize the channel list from database/channels.json.
+
+    Accepted entry formats:
+      "@username"                                        -> public channel
+      {"title":..., "peer_id":..., "is_private": true}   -> private channel/group
+
+    Returns normalized dicts:
+      {'peer': '@username'|None, 'id': int|None, 'title': str, 'is_private': bool}
+    """
+    path = os.path.join(db_dir, channels_file)
+
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+        except json.JSONDecodeError:
+            print(f"Invalid JSON in {path} - fix or delete the file.")
+            sys.exit(1)
+        if not isinstance(raw, list) or not raw:
+            print(f"No channels in {path}. Add usernames like \"@channel\".")
+            sys.exit(1)
+    else:
+        os.makedirs(db_dir, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(DEFAULT_CHANNELS, f, ensure_ascii=False, indent=2)
+        print(f"Seeded channel list: {path} ({len(DEFAULT_CHANNELS)} channels)")
+        raw = list(DEFAULT_CHANNELS)
+
+    entries = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            u = item.strip()
+            entries.append({'peer': u, 'id': None, 'title': u,
+                            'is_private': False})
+        elif isinstance(item, dict):
+            pid = item.get('peer_id') or item.get('id')
+            title = (item.get('title') or item.get('username')
+                     or (str(pid) if pid else None))
+            if not title:
+                continue
+            entries.append({
+                'peer': item.get('username'),
+                'id': pid,
+                'title': title,
+                'is_private': bool(item.get('is_private')) or
+                              (pid is not None and not item.get('username')),
+            })
+    return entries
+
+
+# ================= LINK EXTRACTION =================
+def extract_hidden_links(msg):
+    """
+    Extract all hidden/embedded links from a message.
+
+    Returns a list of (source, label, url) tuples:
+      - source: where the link was found ('hyperlink', 'button', 'preview')
+      - label : the visible text associated with the link
+      - url   : the actual destination URL
+    """
+    links = []
+    text = msg.message or ""
+
+    # 1) Embedded hyperlinks (text with a URL hidden underneath)
+    for ent in (msg.entities or []):
+        if isinstance(ent, MessageEntityTextUrl):
+            label = text[ent.offset:ent.offset + ent.length]
+            links.append(('hyperlink', label, ent.url))
+        elif isinstance(ent, MessageEntityMentionName):
+            label = text[ent.offset:ent.offset + ent.length]
+            links.append(('user', label, f"tg://user?id={ent.user_id}"))
+
+    # 2) Web preview (the link card Telegram shows under the message)
+    preview = getattr(msg, 'web_preview', None)
+    if preview is not None:
+        url = getattr(preview, 'url', None)
+        if url:
+            links.append(('preview', 'web_preview', url))
+
+    # 3) Inline buttons under the message
+    try:
+        if msg.buttons:
+            for row in msg.buttons:
+                for btn in row:
+                    if getattr(btn, 'url', None):
+                        links.append(('button', btn.text, btn.url))
+    except Exception:
+        pass  # buttons not available for this message
+
+    return links
+
+
+# ================= MAIN LOOP =================
+async def run_scraper(cfg, channels):
+    sc = cfg.get('scraper', {})
+    paths = cfg.get('paths', {})
+
+    message_limit = int(sc.get('message_limit', 10))
+    request_delay = int(sc.get('request_delay', 1))
+
+    output_dir = paths.get('output_dir', 'output')
+    messages_file = paths.get('messages_file', 'public_messages.txt')
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, messages_file)
+
+    saved_channels = 0
+    total_messages = 0
+    total_links = 0
+
+    print(f"Fetching last {message_limit} messages "
+          f"from {len(channels)} channels...")
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(f"=== PUBLIC CHANNELS LOG "
+                f"(LAST {message_limit} MESSAGES EACH) ===\n\n")
+
+        for index, ch in enumerate(channels, start=1):
+            target = ch['id'] if ch['is_private'] else ch['peer']
+            label = ch['title']
+
+            try:
+                print(f"[{index}/{len(channels)}] Fetching {label} ...")
+
+                messages = await client.get_messages(target,
+                                                     limit=message_limit)
+
+                if not messages:
+                    print(f"[{label}] -> No messages found or inaccessible.")
+                    continue
+
+                f.write(f"--- CHAT: {label} ---\n")
+
+                for msg in reversed(messages):
+                    has_text = bool(msg.message)
+                    links = extract_hidden_links(msg)
+
+                    if not has_text and not links:
+                        continue
+
+                    date_str = msg.date.strftime("%Y-%m-%d %H:%M")
+                    f.write(f"[{date_str}]\n")
+
+                    if has_text:
+                        f.write(f"{msg.message}\n")
+
+                    for source, lnk_label, url in links:
+                        f.write(f"  >> LINK ({source}): "
+                                f"\"{lnk_label}\" -> {url}\n")
+
+                    total_links += len(links)
+                    f.write("-" * 20 + "\n")
+
+                f.write("\n\n")
+                saved_channels += 1
+                total_messages += len(messages)
+                print(f"[{label}] -> Saved {len(messages)} messages.")
+
+                await asyncio.sleep(request_delay)
+
+            except errors.FloodWaitError as e:
+                print(f"[{label}] -> FloodWait! Sleeping {e.seconds} seconds...")
+                await asyncio.sleep(e.seconds + 2)
+
+            except (ValueError, TypeError) as e:
+                print(f"[{label}] -> Skipped: {e}")
+
+            except Exception as e:
+                print(f"[{label}] -> Failed: {e}")
+
+    print("\n==================== SUMMARY ====================")
+    print(f"Channels saved : {saved_channels}/{len(channels)}")
+    print(f"Messages saved : {total_messages}")
+    print(f"Links found    : {total_links}")
+    print(f"Output file    : {output_path}")
+    print("=================================================")
+    
+# ================= ENTRY POINT =================
+def main():
+    cfg = load_config()
+
+    paths = cfg.get('paths', {})
+    db_dir = paths.get('database_dir', 'database')
+    channels = load_channels(db_dir, paths.get('channels_file', 'channels.json'))
+
+    api_id, api_hash = load_credentials()
+
+    global client
+    client = TelegramClient(
+        'v2tel_scraper',
+        api_id,
+        api_hash,
+        proxy=build_proxy(cfg.get('proxy', {})),
+    )
+
+    with client:
+        client.loop.run_until_complete(run_scraper(cfg, channels))
+        
+client = None  # created in main() after loading the config
+
+if __name__ == '__main__':
+    main()
+```
+
+## sync.py
+
+```python
+"""
+Channel Sync (two-way folder sync)
+==================================
+The Telegram folder ([sync] folder_title) is the shared surface between
+the user (phone) and this tool:
+
+  - The CODE side joins public channels and puts them into the folder.
+  - The USER side may add any chat to the folder (e.g. private channels,
+    which the code never adds) or remove chats from it.
+
+sync.py reconciles both sides using a snapshot file
+(database/folder_state.json) that records what the code last wrote:
+
+  1. Reads the folder. If it does not exist (first run) it is created.
+  2. Items in the folder but not in the snapshot  -> user additions
+     -> adopted into database/channels.json (public and private alike).
+  3. Items in the snapshot but missing from the folder -> user removals
+     -> dropped from channels.json (no longer scanned).
+  4. Items removed from channels.json by hand -> removed from the folder.
+  5. Joins public channels we are not a member of yet.
+  6. Applies the remaining delta to the folder as a single modification
+     (never a full rebuild of unrelated content) and refreshes the
+     snapshot.
+
+Private memberships are added to channels.json directly
+([sync] include_private) but never placed into the folder by code.
+
+Usage:
+    python sync.py
+"""
+
+import asyncio
+import json
+import os
+
+from telethon import errors, functions, types
+from telethon import utils as tl_utils
+from telethon import TelegramClient
+
+from scraper import load_credentials, load_config, load_channels
+
+# Telegram free accounts allow max peers per folder
+FOLDER_PEER_LIMIT = 100
+
+
+# ---------- channels.json (mixed format) helpers ----------
+def get_filter_list(result):
+    """
+    Telethon layer compatibility: GetDialogFiltersRequest returns a plain
+    list of filters on older layers, and a DialogFilters object (holding
+    them in .filters) on newer ones.
+    """
+    filters = getattr(result, 'filters', None)
+    if filters is not None:
+        return list(filters)
+    try:
+        return list(result)
+    except TypeError:
+        return []
+
+def entry_key(entry):
+    """Stable identity key: '@username' (public) or 'id:<marked>' (private)."""
+    if entry.get('peer'):
+        return entry['peer'].lower()
+    if entry.get('id') is not None:
+        return f"id:{entry['id']}"
+    return None
+
+
+def save_channels(path, entries):
+    """Write normalized entries back to channels.json (mixed format)."""
+    raw = []
+    for e in entries:
+        if e['is_private']:
+            raw.append({
+                'title': e['title'],
+                'peer_id': e['id'],
+                'username': e.get('peer'),
+                'is_private': True,
+            })
+        else:
+            raw.append(e['peer'])
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+
+
+# ---------- folder_state.json helpers ----------
+
+def load_state(path):
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        return set()
+    return set(data) if isinstance(data, list) else set()
+
+
+def save_state(path, keys):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(sorted(keys), f, ensure_ascii=False, indent=2)
+
+
+# ---------- folder primitives ----------
+
+def filter_title_text(f):
+    """Folder title as plain text (handles str and TextWithEntities)."""
+    t = getattr(f, 'title', None)
+    if t is None:
+        return None
+    return getattr(t, 'text', t)
+
+
+async def read_folder(client, title):
+    """
+    Read the live folder.
+
+    Returns (folder_filter_or_None, {key: include_peer}).
+    Peers that resolve to personal accounts/bots are skipped (not tracked).
+    """
+    try:
+        result = await client(functions.messages.GetDialogFiltersRequest())
+    except Exception as e:
+        print(f"    [!] Could not read folders: {e}")
+        return None, {}
+    filters_list = get_filter_list(result)
+    
+    folder = None
+    for f in filters_list:
+        if isinstance(f, types.DialogFilterDefault):
+            continue
+        if filter_title_text(f) == title:
+            folder = f
+            break
+
+    if folder is None:
+        return None, {}
+
+    peers = {}
+    for p in folder.include_peers:
+        try:
+            ent = await client.get_entity(p)
+        except Exception:
+            continue  # keep the peer in the filter, just not tracked
+        if isinstance(ent, types.User):
+            continue
+        uname = getattr(ent, 'username', None)
+        if uname:
+            peers[f'@{uname}'.lower()] = p
+        else:
+            peers[f'id:{tl_utils.get_peer_id(ent)}'] = p
+    return folder, peers
+
+
+async def write_folder(client, title, include_peers):
+    """
+    Create or update the folder so its include_peers equals the given list.
+    Returns the folder id. Single UpdateDialogFilter call (plus a possible
+    retry for Telethon layer title-type differences).
+    """
+    result = await client(functions.messages.GetDialogFiltersRequest())
+    filters_list = get_filter_list(result)
+    
+    existing = None
+    existing_ids = []
+    for f in filters_list:
+        if isinstance(f, types.DialogFilterDefault):
+            continue
+        existing_ids.append(getattr(f, 'id', 0) or 0)
+        if filter_title_text(f) == title:
+            existing = f
+
+    fid = existing.id if existing is not None else (max(existing_ids, default=0) + 1)
+
+    # Match the title representation the current layer expects
+    sample = filter_title_text(existing) if existing else title
+    if not isinstance(sample, str):
+        first = types.TextWithEntities(text=title, entities=[])
+        second = title
+    else:
+        first = title
+        second = types.TextWithEntities(text=title, entities=[])
+
+    def make(t):
+        return types.DialogFilter(
+            id=fid, title=t,
+            include_peers=include_peers,
+            pinned_peers=[], exclude_peers=[],
+            contacts=False, non_contacts=False, groups=False,
+            broadcasts=False, bots=False,
+            exclude_muted=False, exclude_read=False, exclude_new=False,
+        )
+
+    try:
+        await client(functions.messages.UpdateDialogFilterRequest(
+            id=fid, filter=make(first)))
+    except Exception:
+        await client(functions.messages.UpdateDialogFilterRequest(
+            id=fid, filter=make(second)))
+    return fid
+
+
+async def add_entry_to_folder(client, title, entry, state_path):
+    """
+    Add ONE channel entry to the folder (used by discover.py right after
+    accepting a new channel). No-op if already present or folder is full.
+    Returns True if the folder was modified.
+    """
+    folder, actual = await read_folder(client, title)
+    key = entry_key(entry)
+
+    if folder is None:
+        peer = await client.get_input_entity(entry['peer'] or entry['id'])
+        await write_folder(client, title, [peer])
+        save_state(state_path, {key})
+        return True
+
+    if key in actual:
+        return False
+
+    if len(folder.include_peers) >= FOLDER_PEER_LIMIT:
+        print(f"    [!] Folder is full ({FOLDER_PEER_LIMIT}) - "
+              f"channel kept in channels.json only.")
+        return False
+
+    peer = await client.get_input_entity(entry['peer'] or entry['id'])
+    await write_folder(client, title, list(folder.include_peers) + [peer])
+
+    state = load_state(state_path)
+    state.add(key)
+    save_state(state_path, state)
+    return True
+
+
+# ---------- main ----------
+
+async def run():
+    cfg = load_config()
+    sync_cfg = cfg.get('sync', {})
+    if not sync_cfg.get('enabled', True):
+        print("Sync is disabled in config.toml ([sync] enabled = false).")
+        return
+
+    folder_title = sync_cfg.get('folder_title', 'v2tel')
+    include_private = bool(sync_cfg.get('include_private', True))
+    join_delay = float(sync_cfg.get('join_delay', 1.0))
+
+    paths = cfg.get('paths', {})
+    db_dir = paths.get('database_dir', 'database')
+    channels_path = os.path.join(db_dir,
+                                 paths.get('channels_file', 'channels.json'))
+    state_path = os.path.join(db_dir,
+                              paths.get('folder_state_file',
+                                        'folder_state.json'))
+
+    entries = load_channels(db_dir, paths.get('channels_file', 'channels.json'))
+    print(f"channels.json: {len(entries)} entries")
+
+    api_id, api_hash = load_credentials()
+    pc = cfg.get('proxy', {})
+    proxy = None
+    if pc.get('enabled', False):
+        import socks
+        ptype = (socks.SOCKS5 if pc.get('type', 'socks5') == 'socks5'
+                 else socks.HTTP)
+        proxy = (ptype, pc.get('host', '127.0.0.1'), int(pc.get('port', 10808)))
+
+    client = TelegramClient('v2tel_scraper', api_id, api_hash, proxy=proxy)
+
+    async with client:
+        # ---- 1) Dialogs: memberships + joined usernames ----
+        print("\n[1/5] Reading your dialogs...")
+        joined_usernames = set()
+        memberships = []
+        async for d in client.iter_dialogs():
+            ent = d.entity
+            if isinstance(ent, types.User):
+                continue
+            uname = getattr(ent, 'username', None)
+            if uname:
+                joined_usernames.add(uname.lower())
+            memberships.append((tl_utils.get_peer_id(ent), ent, d.name or ''))
+
+        # ---- 2) Read folder + snapshot, compute the user diff ----
+        print(f"[2/5] Reading folder '{folder_title}' and snapshot...")
+        folder, actual = await read_folder(client, folder_title)
+        state = load_state(state_path)
+
+        if folder is None:
+            print("    Folder does not exist - it will be created.")
+            user_added = set()
+            user_removed = set()   # guard: deleting the whole folder on the
+            db_removed = set()     # phone is NOT treated as removing all
+        else:
+            user_added = set(actual) - state
+            user_removed = state - set(actual)
+            known_now = {entry_key(e) for e in entries}
+            db_removed = {k for k in (state & set(actual))
+                          if k not in known_now}
+
+        changed_db = False
+
+        # ---- 3) Adopt user additions into channels.json ----
+        if user_added:
+            print(f"[3/5] Adopting {len(user_added)} folder addition(s)...")
+            for key in user_added:
+                try:
+                    ent = await client.get_entity(actual[key])
+                except Exception as e:
+                    print(f"    [!] {key}: cannot resolve ({str(e)[:40]})")
+                    continue
+                if isinstance(ent, types.User):
+                    print(f"    [!] {key}: personal chat, skipped")
+                    continue
+                uname = getattr(ent, 'username', None)
+                username = f"@{uname}" if uname else None
+                marked = tl_utils.get_peer_id(ent)
+                title = (getattr(ent, 'title', None) or username
+                         or str(marked))
+                is_broadcast = bool(getattr(ent, 'broadcast', False))
+                entries.append({
+                    'peer': username if (username and is_broadcast) else None,
+                    'id': marked,
+                    'title': title,
+                    'is_private': not (username and is_broadcast),
+                })
+                changed_db = True
+                kind = 'public' if (username and is_broadcast) else 'private'
+                print(f"    [+] User added ({kind}): {title} "
+                      f"({username or marked})")
+        else:
+            print("[3/5] No user additions in folder.")
+
+        # ---- 4) Apply user removals to channels.json ----
+        if user_removed:
+            before = len(entries)
+            entries = [e for e in entries
+                       if entry_key(e) not in user_removed]
+            changed_db = True
+            print(f"[4/5] User removed {before - len(entries)} "
+                  f"channel(s) from folder -> dropped from channels.json")
+            for k in user_removed:
+                print(f"    [-] {k}")
+        else:
+            print("[4/5] No user removals detected.")
+
+        # ---- Membership scan (private channels & groups) ----
+        if include_private:
+            known_now = {entry_key(e) for e in entries}
+            new_members = 0
+            for marked, ent, title in memberships:
+                uname = getattr(ent, 'username', None)
+                username = f"@{uname}" if uname else None
+                key = username.lower() if username else f"id:{marked}"
+                if key in known_now:
+                    continue
+                title = title or username or str(marked)
+                is_broadcast = bool(getattr(ent, 'broadcast', False))
+                entries.append({
+                    'peer': username if (username and is_broadcast) else None,
+                    'id': marked,
+                    'title': title,
+                    'is_private': not (username and is_broadcast),
+                })
+                known_now.add(key)
+                changed_db = True
+                new_members += 1
+            if new_members:
+                print(f"    [+] {new_members} new membership(s) added "
+                      f"to channels.json")
+        if changed_db:
+            save_channels(channels_path, entries)
+            print(f"    channels.json saved ({len(entries)} entries)")
+
+        # ---- 5) Join missing public channels ----
+        print("[5/5] Joining missing public channels...")
+        joined_count = 0
+        for e in entries:
+            if e['is_private'] or not e['peer']:
+                continue
+            uname = e['peer'].lstrip('@').lower()
+            if uname in joined_usernames:
+                continue
+            try:
+                await client(functions.channels.JoinChannelRequest(e['peer']))
+                joined_usernames.add(uname)
+                joined_count += 1
+                print(f"    [+] Joined: {e['peer']}")
+            except errors.UserAlreadyParticipantError:
+                joined_usernames.add(uname)
+            except errors.FloodWaitError as ex:
+                print(f"    [!] FloodWait {ex.seconds}s - stopping joins.")
+                break
+            except errors.ChannelPrivateError:
+                print(f"    [!] {e['peer']}: invite-only (kept in list).")
+            except Exception as ex:
+                print(f"    [!] {e['peer']}: {str(ex)[:60]}")
+            await asyncio.sleep(join_delay)
+
+        # ---- Folder delta: single modification (add/remove only) ----
+        known_now = {entry_key(e) for e in entries}
+
+        # peers to remove from folder (user deleted them from channels.json)
+        drop_peers = {actual[k] for k in db_removed if k in actual}
+        base_peers = [p for p in (folder.include_peers if folder else [])
+                      if p not in drop_peers]
+
+        # public entries missing from the folder
+        to_add = [e for e in entries
+                  if not e['is_private'] and e.get('peer')
+                  and entry_key(e) not in actual
+                  and entry_key(e) not in user_removed]
+
+        added_keys = set()
+        skipped_full = 0
+        for e in to_add:
+            if len(base_peers) >= FOLDER_PEER_LIMIT:
+                skipped_full += 1
+                continue
+            try:
+                peer = await client.get_input_entity(e['peer'])
+                base_peers.append(peer)
+                added_keys.add(entry_key(e))
+            except Exception as ex:
+                print(f"    [!] Folder: cannot resolve {e['peer']}: "
+                      f"{str(ex)[:40]}")
+
+        if folder is not None and not added_keys and not drop_peers:
+            print("    Folder already up to date (no changes).")
+            new_state = state
+        else:
+            await write_folder(client, folder_title, base_peers)
+            new_state = (state - user_removed - db_removed) \
+                | set(actual) - db_removed | added_keys
+            new_state = {k for k in new_state if k}
+            print(f"    Folder updated: +{len(added_keys)} "
+                  f"(-{len(drop_peers)}), "
+                  f"{len(base_peers)}/{FOLDER_PEER_LIMIT} peers")
+            if skipped_full:
+                print(f"    [!] {skipped_full} channel(s) not added - "
+                      f"folder full (kept in channels.json).")
+
+        save_state(state_path, new_state)
+
+        print("\n==================== SYNC SUMMARY ====================")
+        print(f"User additions adopted : {len(user_added)}")
+        print(f"User removals applied  : {len(user_removed)}")
+        print(f"Newly joined channels  : {joined_count}")
+        print(f"Folder peers           : {len(base_peers)}"
+              f"/{FOLDER_PEER_LIMIT}")
+        print("======================================================")
+
+
+def main():
+    asyncio.run(run())
+
+
+if __name__ == '__main__':
+    main()
+```
+
+## whoami.py
+
+```python
+# whoami.py - shows which account the session belongs to
+import asyncio
+from telethon import TelegramClient
+from scraper import load_credentials, load_config, build_proxy
+
+cfg = load_config()
+api_id, api_hash = load_credentials()
+
+client = TelegramClient(
+    'v2tel_scraper',
+    api_id,
+    api_hash,
+    proxy=build_proxy(cfg.get('proxy', {})),
+)
+
+async def main():
+    me = await client.get_me()
+    print(f"Name  : {me.first_name}")
+    print(f"Phone : {me.phone}")
+    print(f"User  : @{me.username}")
+
+with client:
+    client.loop.run_until_complete(main())
+```
+

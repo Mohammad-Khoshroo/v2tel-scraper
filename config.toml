@@ -5,12 +5,10 @@
 [sync]
 enabled = true
 folder_title = "v2tel"     # Telegram folder mirroring channels.json
-include_private = true     # add ALL channel/group memberships (incl. private)
-join_delay = 3.0           # seconds between join attempts
 
 [scraper]
 # How many latest messages to fetch from each channel
-message_limit = 1
+message_limit = 10
 
 # Seconds to wait between channel requests (avoid Telegram rate limits)
 request_delay = 1
@@ -18,10 +16,10 @@ request_delay = 1
 
 [discovery] # NEW: audition settings for found channels
 enabled = true
-messages_per_channel = 100 # how many messages to read per candidate
-min_config_hits = 1        # unique proxy+config links needed to accept
-max_per_run = 20           # candidates checked per run (FloodWait protection)
-request_delay = 1.5
+messages_per_channel = 100  # how many messages to read per candidate
+min_config_hits = 1         # unique proxy+config links needed to accept
+max_per_run = 100           # candidates checked per run (FloodWait protection)
+request_delay = 2
 
 
 [proxy]
@@ -56,3 +54,4 @@ external_links_log = "external_links.log"
 channels_file = "channels.json"
 channel_status_file = "channel_status.json"
 discovered_channels_log = "discovered_channels.log"
+folder_state_file = "folder_state.json"

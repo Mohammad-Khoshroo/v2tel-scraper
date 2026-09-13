@@ -165,8 +165,8 @@ def main():
     # --- Stage 0: sync ---
     if not (args.skip_scraper or args.only_extract or args.only_discover
             or args.skip_sync):
-        run_stage('sync.py', 'Join channels + sync folder + memberships')
-        
+        run_stage('sync.py', 'Sync v2tel folder <-> channels.json')
+
     # --- Stage 1: scrape ---
     if not (args.skip_scraper or args.only_extract or args.only_discover):
         run_stage('scraper.py', 'Fetch messages from Telegram')
