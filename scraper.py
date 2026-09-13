@@ -17,7 +17,6 @@ import asyncio
 import json
 import os
 import socks
-import subprocess
 import sys
 import tomllib
 
@@ -263,20 +262,8 @@ async def run_scraper(cfg, channels):
     print(f"Links found    : {total_links}")
     print(f"Output file    : {output_path}")
     print("=================================================")
-
-    # Optionally run the extractor right after scraping
-    if sc.get('auto_extract', True):
-        print("\nRunning extractor...")
-        subprocess.run([sys.executable, 'extractor.py'], check=False)
     
-    # Optionally audition newly discovered channels
-    if sc.get('auto_discover', True):
-        print("\nRunning discovery validator...")
-        subprocess.run([sys.executable, 'discover.py'], check=False)
-
-
 # ================= ENTRY POINT =================
-# main() نهایی:
 def main():
     cfg = load_config()
 

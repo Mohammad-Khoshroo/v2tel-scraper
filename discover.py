@@ -31,11 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from telethon import TelegramClient, errors
 from telethon.tl.types import Channel, User
-
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+import tomllib
 
 # Reuse the regexes/cleaners from extractor and the link extractor
 # from scraper so the detection logic stays identical everywhere.
@@ -241,8 +237,9 @@ async def run():
 
             # Users (personal accounts) are not interesting for us
             if isinstance(entity, User):
-                print("    [x] This is a personal account, not a channel -> rejected")
-                status[key] = {'status': 'rejected', 'reason': 'user',
+                kind = 'bot' if getattr(entity, 'bot', False) else 'personal account'
+                print(f"    [x] This is a {kind}, not a channel -> rejected")
+                status[key] = {'status': 'rejected', 'reason': kind,
                                'checked_at': datetime.now().isoformat()}
                 save_status(status_path, status)
                 rejected += 1

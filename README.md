@@ -13,11 +13,15 @@ or on a remote **server / VPS**.
 - Python 3.8+
 - A Telegram account
 - Telegram API credentials (`api_id` and `api_hash`)
+```bash
+pip3 install telethon pysocks python-socks tomllib json
+```
+
 
 ### Getting API credentials
 
 1. Go to <https://my.telegram.org>
-2. Log in with your phone number
+1. Log in with your phone number
 3. Open **API development tools**
 4. Create an application (platform choice does not matter)
 5. Copy your `api_id` (number) and `api_hash` (string)
@@ -27,27 +31,7 @@ or on a remote **server / VPS**.
 
 ---
 
-## 2. Installation
-
-### Windows (native)
-
-1. Install Python from <https://www.python.org/downloads/>
-   - **Important:** check ☑ "Add Python to PATH" during installation.
-2. Open **Command Prompt** or **PowerShell**:
-
-```bat
-pip install telethon pysocks
-```
-
-### WSL2 / Linux
-
-```bash
-pip3 install telethon pysocks
-```
-
----
-
-## 3. Proxy Configuration (running from Iran?)
+## 2. Proxy Configuration (running from Iran?)
 
 Telegram is blocked in Iran, so the script must connect through a proxy.
 This section assumes a local **SOCKS5** proxy (v2rayN, v2rayA, Nekoray,
@@ -56,14 +40,14 @@ clash, etc.).
 Pick the subsection matching **where the script runs** and **where the
 proxy runs**:
 
-| Your setup | Use |
-|------------|-----|
-| Script + proxy on the same Windows machine | Case 1 |
-| Script in WSL2 (mirrored mode) | Case 2 |
-| Script in WSL2 (NAT mode) | Case 3 |
-| Script on Linux, proxy on the **same** Linux machine | Case 4a |
-| Script on Linux, proxy on **another** machine | Case 4b |
-| Script on a VPS **outside** Iran | No proxy needed |
+| Your setup                                           | Use             |
+| ---------------------------------------------------- | --------------- |
+| Script + proxy on the same Windows machine           | Case 1          |
+| Script in WSL2 (mirrored mode)                       | Case 2          |
+| Script in WSL2 (NAT mode)                            | Case 3          |
+| Script on Linux, proxy on the **same** Linux machine | Case 4a         |
+| Script on Linux, proxy on **another** machine        | Case 4b         |
+| Script on a VPS **outside** Iran                     | No proxy needed |
 
 **Rule of thumb:** if the script and the proxy run on the *same machine*,
 use `127.0.0.1`. If they run on *different machines*, use the proxy
@@ -177,11 +161,11 @@ This behaves like Case 1: script and proxy share `localhost`.
 
 Common proxy tools on Linux and their **default SOCKS ports**:
 
-| Tool | Default SOCKS5 port |
-|------|--------------------|
-| v2rayA | `20170` |
-| Nekoray / NekoBox | `2080` |
-| clash / mihomo | `7890` (mixed) |
+| Tool                         | Default SOCKS5 port     |
+| ---------------------------- | ----------------------- |
+| v2rayA                       | `20170`                 |
+| Nekoray / NekoBox            | `2080`                  |
+| clash / mihomo               | `7890` (mixed)          |
 | xray / v2ray (manual config) | whatever you configured |
 
 **1.** Make sure your proxy tool is running and connected.
@@ -251,7 +235,7 @@ USE_PROXY = False
 
 ---
 
-## 4. Running
+## 3. Running
 
 ```bash
 # Windows
@@ -265,11 +249,11 @@ python3 scraper.py
 
 The first run asks for:
 
-| Prompt | What to enter |
-|--------|---------------|
-| Phone number | International format, e.g. `+98912xxxxxxx` |
+| Prompt            | What to enter                                                 |
+| ----------------- | ------------------------------------------------------------- |
+| Phone number      | International format, e.g. `+98912xxxxxxx`                    |
 | Confirmation code | Sent to your **Telegram app** (chat with "Telegram"), not SMS |
-| 2FA password | Only if you have one enabled |
+| 2FA password      | Only if you have one enabled                                  |
 
 After login, a `scraper_session.session` file is created. Subsequent runs
 **skip the login entirely**.
@@ -282,25 +266,15 @@ All messages are written to `public_messages.txt` next to the script.
 
 ---
 
-## 5. Troubleshooting
+## 4. Troubleshooting
 
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| `ConnectionRefusedError` | Proxy not listening / LAN blocked | Enable "Allow LAN", restart the proxy tool |
-| Timeout | Wrong `PROXY_HOST` or port | Verify with `curl -x socks5h://...` first |
-| Timeout in NAT mode / Case 4b | Firewall | Allow the SOCKS port (TCP) through the firewall |
-| `python` not recognized (Windows) | Python not in PATH | Reinstall Python with "Add to PATH" checked |
-| `FloodWait` in output | Telegram rate limit | Script sleeps automatically and continues; lower `MESSAGE_LIMIT` if frequent |
-| `Could not find the input entity` | Channel deleted/renamed | Ignore — script continues with remaining channels |
+| Problem                           | Cause                             | Fix                                                                          |
+| --------------------------------- | --------------------------------- | ---------------------------------------------------------------------------- |
+| `ConnectionRefusedError`          | Proxy not listening / LAN blocked | Enable "Allow LAN", restart the proxy tool                                   |
+| Timeout                           | Wrong `PROXY_HOST` or port        | Verify with `curl -x socks5h://...` first                                    |
+| Timeout in NAT mode / Case 4b     | Firewall                          | Allow the SOCKS port (TCP) through the firewall                              |
+| `python` not recognized (Windows) | Python not in PATH                | Reinstall Python with "Add to PATH" checked                                  |
+| `FloodWait` in output             | Telegram rate limit               | Script sleeps automatically and continues; lower `MESSAGE_LIMIT` if frequent |
+| `Could not find the input entity` | Channel deleted/renamed           | Ignore — script continues with remaining channels                            |
 
 ---
-
-## 6. Notes
-
-- `MESSAGE_LIMIT = 1000` over ~75 channels is heavy; start with a small
-  value (e.g. `10`) for testing.
-- Reading public channels does **not** require joining them.
-- Channels that no longer exist are skipped gracefully.
-- The script works identically everywhere — only `PROXY_HOST`,
-  `PROXY_PORT` and `USE_PROXY` change depending on your setup
-  (see section 3).
