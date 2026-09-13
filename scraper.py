@@ -29,6 +29,7 @@ from telethon.tl.types import (
 
 
 CONFIG_FILE = 'config.toml'
+CREDENTIALS_FILE = 'APIK.lock'
 
 # Channels written to database/channels.json on the very first run.
 # Edit database/channels.json afterwards to add/remove channels.
@@ -60,17 +61,45 @@ def load_config(path=CONFIG_FILE):
 
     with open(path, 'rb') as f:
         cfg = tomllib.load(f)
-
-    tg = cfg.get('telegram', {})
-    if not tg.get('api_id') or not tg.get('api_hash'):
-        print("Please set 'api_id' and 'api_hash' in config.toml.")
-        sys.exit(1)
-    if str(tg.get('api_hash', '')).startswith('PASTE_'):
-        print("Please replace the placeholder api_hash in config.toml.")
-        sys.exit(1)
-
+        
     return cfg
 
+def load_credentials(path=CREDENTIALS_FILE):
+    """
+    Read api_id / api_hash from the personal APIK.lock file.
+
+    Format: simple 'key = value' lines; '#' starts a comment.
+    Keeps credentials out of config.toml so the project can be shared
+    without leaking them.
+    """
+    if not os.path.exists(path):
+        print(f"Credentials file not found: {path}")
+        print("Create it next to scraper.py with these two lines:")
+        print("    api_id = <your api_id>")
+        print("    api_hash = <your api_hash>")
+        print("Get them from https://my.telegram.org -> API development tools.")
+        sys.exit(1)
+
+    creds = {}
+    with open(path, 'r', encoding='utf-8') as f:
+        for raw in f:
+            line = raw.split('#', 1)[0].strip()  # strip comments
+            if not line or '=' not in line:
+                continue
+            key, _, value = line.partition('=')
+            creds[key.strip().lower()] = value.strip().strip('"\'')
+
+    api_id = creds.get('api_id', '')
+    api_hash = creds.get('api_hash', '')
+
+    if not api_id.isdigit():
+        print(f"Invalid or missing 'api_id' in {path}.")
+        sys.exit(1)
+    if not api_hash or api_hash.startswith('PASTE_'):
+        print(f"Invalid or missing 'api_hash' in {path}.")
+        sys.exit(1)
+
+    return int(api_id), api_hash
 
 def build_proxy(pc):
     """Build the proxy tuple for Telethon, or None if disabled."""
@@ -247,6 +276,7 @@ async def run_scraper(cfg, channels):
 
 
 # ================= ENTRY POINT =================
+# main() نهایی:
 def main():
     cfg = load_config()
 
@@ -254,19 +284,19 @@ def main():
     db_dir = paths.get('database_dir', 'database')
     channels = load_channels(db_dir, paths.get('channels_file', 'channels.json'))
 
+    api_id, api_hash = load_credentials()
+
     global client
-    tg = cfg.get('telegram', {})
     client = TelegramClient(
-        tg.get('session', 'v2tel_scraper'),
-        int(tg['api_id']),
-        tg['api_hash'],
+        'v2tel_scraper',
+        api_id,
+        api_hash,
         proxy=build_proxy(cfg.get('proxy', {})),
     )
 
     with client:
         client.loop.run_until_complete(run_scraper(cfg, channels))
-
-
+        
 client = None  # created in main() after loading the config
 
 if __name__ == '__main__':

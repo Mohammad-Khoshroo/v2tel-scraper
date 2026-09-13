@@ -27,6 +27,7 @@ import json
 import os
 import sys
 from datetime import datetime
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from telethon import TelegramClient, errors
 from telethon.tl.types import Channel, User
@@ -39,7 +40,7 @@ except ModuleNotFoundError:
 # Reuse the regexes/cleaners from extractor and the link extractor
 # from scraper so the detection logic stays identical everywhere.
 from extractor import PROXY_RE, CONFIG_RE, B64_RE, clean, try_decode_base64
-from scraper import extract_hidden_links
+from scraper import extract_hidden_links, load_credentials
 
 CONFIG_FILE = 'config.toml'
 
@@ -200,13 +201,14 @@ async def run():
         ptype = socks.SOCKS5 if pc.get('type', 'socks5') == 'socks5' else socks.HTTP
         proxy = (ptype, pc.get('host', '127.0.0.1'), int(pc.get('port', 10808)))
 
+    api_id, api_hash = load_credentials()
     client = TelegramClient(
         tg.get('session', 'v2tel_scraper'),
-        int(tg['api_id']),
-        tg['api_hash'],
+        api_id,
+        api_hash,
         proxy=proxy,
     )
-
+    
     accepted = 0
     rejected = 0
 

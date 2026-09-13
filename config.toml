@@ -3,19 +3,12 @@
 # All user-configurable settings live in this file.
 # ============================================================
 
-[telegram]
-session = "v2tel_scraper"
-
 [scraper]
 # How many latest messages to fetch from each channel
 message_limit = 1
 
 # Seconds to wait between channel requests (avoid Telegram rate limits)
 request_delay = 1
-
-# Run extractor.py automatically after scraping finishes
-auto_extract = true
-auto_discover = true
 
 
 [discovery] # NEW: audition settings for found channels
