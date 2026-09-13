@@ -42,6 +42,21 @@ CONFIG_FILE = 'config.toml'
 
 
 # ================= HELPERS =================
+def channel_keys(channels):
+    """Usernames/ids present in the list (mixed string/dict format)."""
+    keys = set()
+    for e in channels:
+        if isinstance(e, str):
+            keys.add(e.strip().lower())
+        elif isinstance(e, dict):
+            u = e.get('username')
+            if u:
+                keys.add(u.lower())
+            elif e.get('peer_id') is not None:
+                keys.add(f"id:{e['peer_id']}")
+    return keys
+
+
 def load_config():
     with open(CONFIG_FILE, 'rb') as f:
         return tomllib.load(f)
@@ -160,7 +175,7 @@ async def run():
 
     # ---- Load state ----
     channels = load_channels_list(channels_path)
-    known = {c.lower() for c in channels}
+    known = channel_keys(channels)
     status = load_status(status_path)
     candidates = load_lines(discovered_path)
 

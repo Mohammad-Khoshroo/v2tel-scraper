@@ -2,6 +2,11 @@
 # v2tel-scraper configuration
 # All user-configurable settings live in this file.
 # ============================================================
+[sync]
+enabled = true
+folder_title = "v2tel"     # Telegram folder mirroring channels.json
+include_private = true     # add ALL channel/group memberships (incl. private)
+join_delay = 3.0           # seconds between join attempts
 
 [scraper]
 # How many latest messages to fetch from each channel

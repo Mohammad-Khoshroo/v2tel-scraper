@@ -140,6 +140,8 @@ def run_stage(script, description):
 def main():
     parser = argparse.ArgumentParser(
         description='v2tel-scraper orchestrator')
+    parser.add_argument('--skip-sync', action='store_true',
+                        help='skip the channel/folder sync stage')
     parser.add_argument('--skip-scraper', action='store_true',
                         help='skip fetching (extract + discover only)')
     parser.add_argument('--only-extract', action='store_true',
@@ -160,6 +162,11 @@ def main():
     print("           v2tel-scraper pipeline")
     print("===============================================")
 
+    # --- Stage 0: sync ---
+    if not (args.skip_scraper or args.only_extract or args.only_discover
+            or args.skip_sync):
+        run_stage('sync.py', 'Join channels + sync folder + memberships')
+        
     # --- Stage 1: scrape ---
     if not (args.skip_scraper or args.only_extract or args.only_discover):
         run_stage('scraper.py', 'Fetch messages from Telegram')

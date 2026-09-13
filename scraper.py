@@ -111,29 +111,54 @@ def build_proxy(pc):
 # ================= CHANNELS =================
 def load_channels(db_dir, channels_file):
     """
-    Load the channel list from database/channels.json.
-    If the file does not exist, seed it with DEFAULT_CHANNELS.
+    Load and normalize the channel list from database/channels.json.
+
+    Accepted entry formats:
+      "@username"                                        -> public channel
+      {"title":..., "peer_id":..., "is_private": true}   -> private channel/group
+
+    Returns normalized dicts:
+      {'peer': '@username'|None, 'id': int|None, 'title': str, 'is_private': bool}
     """
     path = os.path.join(db_dir, channels_file)
 
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                channels = json.load(f)
+                raw = json.load(f)
         except json.JSONDecodeError:
             print(f"Invalid JSON in {path} - fix or delete the file.")
             sys.exit(1)
-        if not isinstance(channels, list) or not channels:
+        if not isinstance(raw, list) or not raw:
             print(f"No channels in {path}. Add usernames like \"@channel\".")
             sys.exit(1)
-        return channels
+    else:
+        os.makedirs(db_dir, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(DEFAULT_CHANNELS, f, ensure_ascii=False, indent=2)
+        print(f"Seeded channel list: {path} ({len(DEFAULT_CHANNELS)} channels)")
+        raw = list(DEFAULT_CHANNELS)
 
-    # First run: seed the file with the default channel list
-    os.makedirs(db_dir, exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(DEFAULT_CHANNELS, f, ensure_ascii=False, indent=2)
-    print(f"Seeded channel list: {path} ({len(DEFAULT_CHANNELS)} channels)")
-    return list(DEFAULT_CHANNELS)
+    entries = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            u = item.strip()
+            entries.append({'peer': u, 'id': None, 'title': u,
+                            'is_private': False})
+        elif isinstance(item, dict):
+            pid = item.get('peer_id') or item.get('id')
+            title = (item.get('title') or item.get('username')
+                     or (str(pid) if pid else None))
+            if not title:
+                continue
+            entries.append({
+                'peer': item.get('username'),
+                'id': pid,
+                'title': title,
+                'is_private': bool(item.get('is_private')) or
+                              (pid is not None and not item.get('username')),
+            })
+    return entries
 
 
 # ================= LINK EXTRACTION =================
@@ -202,26 +227,28 @@ async def run_scraper(cfg, channels):
         f.write(f"=== PUBLIC CHANNELS LOG "
                 f"(LAST {message_limit} MESSAGES EACH) ===\n\n")
 
-        for index, chat in enumerate(channels, start=1):
-            try:
-                print(f"[{index}/{len(channels)}] Fetching {chat} ...")
+        for index, ch in enumerate(channels, start=1):
+            target = ch['id'] if ch['is_private'] else ch['peer']
+            label = ch['title']
 
-                # Fetch the latest messages (no need to join the channel)
-                messages = await client.get_messages(chat, limit=message_limit)
+            try:
+                print(f"[{index}/{len(channels)}] Fetching {label} ...")
+
+                messages = await client.get_messages(target,
+                                                     limit=message_limit)
 
                 if not messages:
-                    print(f"[{chat}] -> No messages found or inaccessible.")
+                    print(f"[{label}] -> No messages found or inaccessible.")
                     continue
 
-                f.write(f"--- CHAT: {chat} ---\n")
+                f.write(f"--- CHAT: {label} ---\n")
 
-                # Write in chronological order (oldest first)
                 for msg in reversed(messages):
                     has_text = bool(msg.message)
                     links = extract_hidden_links(msg)
 
                     if not has_text and not links:
-                        continue  # media-only message with no text/links
+                        continue
 
                     date_str = msg.date.strftime("%Y-%m-%d %H:%M")
                     f.write(f"[{date_str}]\n")
@@ -229,9 +256,9 @@ async def run_scraper(cfg, channels):
                     if has_text:
                         f.write(f"{msg.message}\n")
 
-                    # Write hidden links right after the message text
-                    for source, label, url in links:
-                        f.write(f"  >> LINK ({source}): \"{label}\" -> {url}\n")
+                    for source, lnk_label, url in links:
+                        f.write(f"  >> LINK ({source}): "
+                                f"\"{lnk_label}\" -> {url}\n")
 
                     total_links += len(links)
                     f.write("-" * 20 + "\n")
@@ -239,22 +266,19 @@ async def run_scraper(cfg, channels):
                 f.write("\n\n")
                 saved_channels += 1
                 total_messages += len(messages)
-                print(f"[{chat}] -> Saved {len(messages)} messages.")
+                print(f"[{label}] -> Saved {len(messages)} messages.")
 
-                # Small delay to avoid Telegram rate limits
                 await asyncio.sleep(request_delay)
 
             except errors.FloodWaitError as e:
-                # Telegram asked us to slow down; wait and continue
-                print(f"[{chat}] -> FloodWait! Sleeping {e.seconds} seconds...")
+                print(f"[{label}] -> FloodWait! Sleeping {e.seconds} seconds...")
                 await asyncio.sleep(e.seconds + 2)
 
             except (ValueError, TypeError) as e:
-                # Usually: channel does not exist anymore or username changed
-                print(f"[{chat}] -> Skipped: {e}")
+                print(f"[{label}] -> Skipped: {e}")
 
             except Exception as e:
-                print(f"[{chat}] -> Failed: {e}")
+                print(f"[{label}] -> Failed: {e}")
 
     print("\n==================== SUMMARY ====================")
     print(f"Channels saved : {saved_channels}/{len(channels)}")
