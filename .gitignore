@@ -13,3 +13,5 @@ output/
 # Python
 __pycache__/
 *.pycs
+
+temp.log
