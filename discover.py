@@ -29,7 +29,7 @@ import os
 import sys
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
+from floodguard import check_and_exit, record_flood
 from telethon import TelegramClient, errors
 from telethon.tl.types import Channel, User
 import tomllib
@@ -156,6 +156,8 @@ def count_hits(messages):
 
 # ================= MAIN =================
 async def run():
+    if check_and_exit('discover'):
+        return
     cfg = load_config()
     disc = cfg.get('discovery', {})
     paths = cfg.get('paths', {})
@@ -252,6 +254,7 @@ async def run():
             except errors.FloodWaitError as e:
                 print(f"    [!] FloodWait {e.seconds}s - stopping this run, "
                       f"remaining candidates stay pending.")
+                record_flood(e.seconds, 'discover')
                 break
             except ValueError:
                 print("    [x] Invalid/unresolvable username -> rejected")
@@ -284,6 +287,7 @@ async def run():
                                                      limit=messages_limit)
             except errors.FloodWaitError as e:
                 print(f"    [!] FloodWait {e.seconds}s - stopping this run.")
+                record_flood(e.seconds, 'discover')
                 break
             except (ValueError, errors.RPCError) as e:
                 print(f"    [x] Cannot read messages: {str(e)[:60]} -> rejected")

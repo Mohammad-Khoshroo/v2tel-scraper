@@ -152,7 +152,7 @@ def load_channels(db_dir, channels_file):
             if not title:
                 continue
             entries.append({
-                'peer': item.get('username'),
+                'peer': item.get('username') or item.get('peer'),
                 'id': pid,
                 'title': title,
                 'is_private': bool(item.get('is_private')) or
@@ -202,7 +202,57 @@ def extract_hidden_links(msg):
 
     return links
 
+def filter_folder_only(entries, db_dir, paths):
+    """
+    Keep only entries confirmed to be inside the Telegram folder
+    (database/folder_state.json, written by sync.py).
+    """
+    state_path = os.path.join(
+        db_dir, paths.get('folder_state_file', 'folder_state.json'))
+    if not os.path.exists(state_path):
+        print("[!] folder_state.json not found (run sync.py first) - "
+              "scraping the full channels.json list.")
+        return entries
+    try:
+        with open(state_path, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return entries
 
+    users = {u.lower().lstrip('@') for u in state.get('usernames', [])}
+    ids = set()
+    for i in state.get('peer_ids', []):
+        try:
+            ids.add(int(i))
+        except (TypeError, ValueError):
+            pass
+
+    kept, skipped = [], []
+    for e in entries:
+        peer = (e.get('peer') or '').lower().lstrip('@')
+        eid = e.get('id')
+        eid = int(eid) if _is_int(eid) else None
+        ok = (peer and peer in users) or (eid is not None and (
+            eid in ids or -eid in ids
+            or (eid > 0 and -1000000000000 - eid in ids)))
+        (kept if ok else skipped).append(e)
+
+    if skipped:
+        print(f"folder_only: {len(kept)} in folder, {len(skipped)} skipped:")
+        for e in skipped[:10]:
+            print(f"    - {e['title']}")
+        if len(skipped) > 10:
+            print(f"    ... and {len(skipped) - 10} more")
+    return kept
+
+
+def _is_int(v):
+    try:
+        int(v)
+        return True
+    except (TypeError, ValueError):
+        return False
+    
 # ================= MAIN LOOP =================
 async def run_scraper(cfg, channels):
     sc = cfg.get('scraper', {})
@@ -294,7 +344,11 @@ def main():
     paths = cfg.get('paths', {})
     db_dir = paths.get('database_dir', 'database')
     channels = load_channels(db_dir, paths.get('channels_file', 'channels.json'))
-
+    if cfg.get('scraper', {}).get('folder_only', False):
+        p = cfg.get('paths', {})
+        channels = filter_folder_only(
+            channels, p.get('database_dir', 'database'), p)
+        
     api_id, api_hash = load_credentials()
 
     global client

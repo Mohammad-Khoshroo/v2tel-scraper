@@ -6,9 +6,15 @@
 enabled = true
 folder_title = "v2tel"     # Telegram folder mirroring channels.json
 
+# Join channels that are in channels.json but not joined yet.
+# Telegram only keeps JOINED chats in a folder - unjoined peers get
+# pruned from the folder on the next sync. Set 0 to disable joining.
+join_per_run = 10         # max joins per run (spam-limit protection)
+
 [scraper]
 # How many latest messages to fetch from each channel
 message_limit = 10
+folder_only = true
 
 # Seconds to wait between channel requests (avoid Telegram rate limits)
 request_delay = 1
@@ -18,7 +24,7 @@ request_delay = 1
 enabled = true
 messages_per_channel = 100  # how many messages to read per candidate
 min_config_hits = 1         # unique proxy+config links needed to accept
-max_per_run = 100           # candidates checked per run (FloodWait protection)
+max_per_run = 20            # candidates checked per run (FloodWait protection)
 request_delay = 2
 
 
