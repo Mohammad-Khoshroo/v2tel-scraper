@@ -1,5 +1,7 @@
 # v2tel-scraper  (README NEEDS TO MODIFY)
 
+Almost 99% of this project is made by LLM Tools, but its Arch is from my mind — thanks to Medanaee
+
 A simple Python script that fetches the latest messages from a list of public
 Telegram channels and saves them to a text file.
 
