@@ -1,4 +1,4 @@
-# v2tel-scraper
+# v2tel-scraper  (NEED TO MODIFY)
 
 A simple Python script that fetches the latest messages from a list of public
 Telegram channels and saves them to a text file.
